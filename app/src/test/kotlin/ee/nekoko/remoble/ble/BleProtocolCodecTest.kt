@@ -66,6 +66,44 @@ class BleProtocolCodecTest {
     }
 
     @Test
+    fun classifiesNbleProfileSwitchStatusWords() {
+        assertEquals(
+                BleProtocolCodec.NbleCardState.READY,
+                BleProtocolCodec.nbleCardState("9000".hexToBytes())
+        )
+        assertEquals(
+                BleProtocolCodec.NbleCardState.PROACTIVE_REFRESH,
+                BleProtocolCodec.nbleCardState("9110".hexToBytes())
+        )
+        assertEquals(
+                BleProtocolCodec.NbleCardState.SETTLING,
+                BleProtocolCodec.nbleCardState("6985".hexToBytes())
+        )
+        assertEquals(
+                BleProtocolCodec.NbleCardState.SETTLING,
+                BleProtocolCodec.nbleCardState("6999".hexToBytes())
+        )
+        assertEquals(
+                BleProtocolCodec.NbleCardState.OTHER,
+                BleProtocolCodec.nbleCardState("6d00".hexToBytes())
+        )
+    }
+
+    @Test
+    fun detectsRefreshFlagInEnableAndDisableProfileCommands() {
+        val iccid = "98100000000000000000"
+        val enable = "80e2910014bf3111a00c5a0a${iccid}8101ff".hexToBytes()
+        val disable = "80e2910014bf3211a00c5a0a${iccid}8101ff".hexToBytes()
+        val noRefresh = "80e2910014bf3111a00c5a0a${iccid}810100".hexToBytes()
+        val unrelated = "80e2910006bf3e035c015a".hexToBytes()
+
+        assertTrue(BleProtocolCodec.nbleRequestsProactiveRefresh(enable))
+        assertTrue(BleProtocolCodec.nbleRequestsProactiveRefresh(disable))
+        assertFalse(BleProtocolCodec.nbleRequestsProactiveRefresh(noRefresh))
+        assertFalse(BleProtocolCodec.nbleRequestsProactiveRefresh(unrelated))
+    }
+
+    @Test
     fun nblePinRulesMatchNekokoLpa2() {
         assertEquals("778899", NbleAuth.calculatePasswordHex(" 778899 "))
         assertEquals("ABCDEF", NbleAuth.calculatePasswordHex("abcdef"))

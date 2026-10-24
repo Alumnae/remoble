@@ -11,6 +11,7 @@ import android.os.IBinder
 import android.util.Base64
 import android.util.Log
 import ee.nekoko.remoble.ble.BleSmartcardService
+import ee.nekoko.remoble.ble.BleCardSettlingException
 import ee.nekoko.remoble.omapi.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -343,6 +344,10 @@ class RemoService : Service() {
     private fun refreshEids() {
         val readers = smartcardService?.readers ?: return
         readers.forEach { reader ->
+            if ((smartcardService as? BleSmartcardService)?.isReaderSettling(reader.name) == true) {
+                Log.d(TAG, "Skipping EID refresh while ${reader.name} is settling")
+                return@forEach
+            }
             // Clear previous errors if we are retrying
             val hadError = slotErrors.containsKey(reader.name)
 
@@ -574,6 +579,11 @@ class RemoService : Service() {
                                             }
                                     mutex.lock()
                                     try {
+                                        if ((smartcardService as? BleSmartcardService)
+                                                        ?.isReaderSettling(reader.name) == true) {
+                                            call.respondMaybeEncrypted(OpenChannelResponse(false))
+                                            return@post
+                                        }
                                         var openedChannel: SmartcardChannel? = null
                                         var matchedAid: String? = null
 
@@ -622,6 +632,9 @@ class RemoService : Service() {
                                                         )
                                                         break
                                                     }
+                                                } catch (e: BleCardSettlingException) {
+                                                    Log.i(TAG, e.message ?: "9eSIM is settling")
+                                                    throw e
                                                 } catch (e: SecurityException) {
                                                     Log.e(
                                                             TAG,
@@ -648,6 +661,9 @@ class RemoService : Service() {
                                         } else {
                                             call.respondMaybeEncrypted(OpenChannelResponse(false))
                                         }
+                                    } catch (e: BleCardSettlingException) {
+                                        closeReaderState(reader.name)
+                                        call.respondMaybeEncrypted(OpenChannelResponse(false))
                                     } finally {
                                         mutex.unlock()
                                     }

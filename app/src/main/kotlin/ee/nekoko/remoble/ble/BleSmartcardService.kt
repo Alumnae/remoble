@@ -22,6 +22,10 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
 import org.json.JSONObject
 
+internal class BleCardSettlingException(val retryAfterMillis: Long) : IllegalStateException(
+        "9eSIM is applying the profile switch; retry in ${retryAfterMillis.coerceAtLeast(0)} ms"
+)
+
 /** BLE-central smart-card backend exposed through the existing RemoCard HTTP API. */
 @SuppressLint("MissingPermission")
 class BleSmartcardService(
@@ -34,6 +38,13 @@ class BleSmartcardService(
         private const val SEEN_TTL_MS = 60_000L
         private const val PREFS_NAME = "remoble_prefs"
         private const val PREF_REMEMBERED_READERS = "ble_remembered_readers"
+        private const val NBLE_SETTLE_QUIET_MS = 20_000L
+        private const val NBLE_SETTLE_MAX_MS = 150_000L
+        private const val NBLE_SETTLE_INITIAL_PROBE_GAP_MS = 5_000L
+        private const val NBLE_SETTLE_MAX_PROBE_GAP_MS = 20_000L
+        private val NBLE_STATUS_APDU = byteArrayOf(
+                0x80.toByte(), 0xF2.toByte(), 0x00, 0x00, 0x00
+        )
     }
 
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -101,6 +112,7 @@ class BleSmartcardService(
      */
     fun reconnectReader(readerName: String): SmartcardSession? {
         val reader = foundReaders.values.firstOrNull { it.name == readerName } ?: return null
+        reader.throwIfSettling()
         Log.w(TAG, "Resetting GATT connection for $readerName")
         reader.disconnect()
         // Some Android Bluetooth stacks need a short quiet period after BluetoothGatt.close()
@@ -108,6 +120,9 @@ class BleSmartcardService(
         Thread.sleep(500)
         return reader.openSession()
     }
+
+    fun isReaderSettling(readerName: String): Boolean =
+            foundReaders.values.firstOrNull { it.name == readerName }?.isSettling() == true
 
     private fun accept(result: ScanResult) {
         val advertised = result.scanRecord?.deviceName.orEmpty()
@@ -186,40 +201,140 @@ class BleSmartcardService(
         @Volatile var lastSeen: Long = System.currentTimeMillis()
         private val lock = Any()
         private var profile: BleProfile? = null
+        private var settleDeadlineMs = 0L
+        private var nextSettleProbeMs = 0L
+        private var settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
+        private var profileSwitchRefreshPending = false
 
         override val isSecureElementPresent: Boolean
             get() = remembered || System.currentTimeMillis() - lastSeen < SEEN_TTL_MS
 
         override fun openSession(): SmartcardSession {
             synchronized(lock) {
+                settleNbleIfRequired()
                 if (profile == null) {
-                    val client = GattClient(context, device)
-                    val configuredPin = prefs.getString(NbleAuth.PREF_KEY, null)
-                            ?.takeIf(NbleAuth::isHexPin)
-                    val newProfile =
-                            BleProfileFactory.create(type, client, displayName, configuredPin)
-                    try {
-                        newProfile.connect()
-                        profile = newProfile
-                        remember(this)
-                    } catch (error: Throwable) {
-                        runCatching { newProfile.close() }
-                        throw error
-                    }
+                    profile = connectProfile()
                 }
             }
             return BleSession(this)
         }
 
+        private fun connectProfile(): BleProfile {
+            val client = GattClient(context, device)
+            val configuredPin = prefs.getString(NbleAuth.PREF_KEY, null)
+                    ?.takeIf(NbleAuth::isHexPin)
+            val newProfile = BleProfileFactory.create(type, client, displayName, configuredPin)
+            try {
+                newProfile.connect()
+                remember(this)
+                return newProfile
+            } catch (error: Throwable) {
+                runCatching { newProfile.close() }
+                throw error
+            }
+        }
+
         fun transceive(command: ByteArray): ByteArray = synchronized(lock) {
             val active = profile ?: error("BLE reader is not connected")
             try {
-                active.transmit(command)
+                if (type == BleProfileFactory.TYPE_NBLE &&
+                        BleProtocolCodec.nbleRequestsProactiveRefresh(command)) {
+                    profileSwitchRefreshPending = true
+                }
+                val response = active.transmit(command)
+                if (type == BleProfileFactory.TYPE_NBLE) {
+                    val state = BleProtocolCodec.nbleCardState(response)
+                    when (state) {
+                        BleProtocolCodec.NbleCardState.PROACTIVE_REFRESH,
+                        BleProtocolCodec.NbleCardState.SETTLING -> {
+                            profileSwitchRefreshPending = false
+                            beginNbleSettle(active)
+                        }
+                        BleProtocolCodec.NbleCardState.READY -> {
+                            if (profileSwitchRefreshPending) {
+                                profileSwitchRefreshPending = false
+                                beginNbleSettle(active)
+                            }
+                        }
+                        BleProtocolCodec.NbleCardState.OTHER -> {
+                            val sw1 = response.getOrNull(response.size - 2)
+                                    ?.toInt()?.and(0xff)
+                            if (sw1 != 0x61) profileSwitchRefreshPending = false
+                        }
+                    }
+                }
+                response
             } catch (error: Exception) {
                 disconnect()
                 throw error
             }
         }
+
+        fun isSettling(): Boolean = synchronized(lock) {
+            type == BleProfileFactory.TYPE_NBLE && settleDeadlineMs != 0L
+        }
+
+        fun throwIfSettling() = synchronized(lock) {
+            if (type == BleProfileFactory.TYPE_NBLE && settleDeadlineMs != 0L) {
+                throw settlingException()
+            }
+        }
+
+        private fun beginNbleSettle(active: BleProfile) {
+            val now = System.currentTimeMillis()
+            if (settleDeadlineMs == 0L) {
+                settleDeadlineMs = now + NBLE_SETTLE_MAX_MS
+                nextSettleProbeMs = now + NBLE_SETTLE_QUIET_MS
+                settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
+                Log.i(TAG, "Releasing ${name} for the handset's proactive REFRESH")
+            }
+            runCatching { active.close() }
+            if (profile === active) profile = null
+        }
+
+        /**
+         * After the mandatory silent window, probe with bare STATUS only. Opening a logical
+         * channel here would send SELECT while the modem is still resetting the card, which is
+         * the sequence that leaves affected 9eSIM readers requiring a physical re-seat.
+         */
+        private fun settleNbleIfRequired() {
+            if (type != BleProfileFactory.TYPE_NBLE || settleDeadlineMs == 0L) return
+            val now = System.currentTimeMillis()
+            if (now < nextSettleProbeMs) throw settlingException(now)
+
+            var probeProfile: BleProfile? = null
+            try {
+                probeProfile = connectProfile()
+                val response = probeProfile.transmit(NBLE_STATUS_APDU)
+                if (BleProtocolCodec.nbleCardState(response) == BleProtocolCodec.NbleCardState.READY) {
+                    Log.i(TAG, "9eSIM ${name} reported idle after profile switch")
+                    settleDeadlineMs = 0L
+                    nextSettleProbeMs = 0L
+                    settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
+                    profile = probeProfile
+                    return
+                }
+                Log.i(TAG, "9eSIM ${name} is still settling (STATUS=${response.toHex()})")
+            } catch (error: Exception) {
+                Log.i(TAG, "9eSIM ${name} settle probe did not complete: ${error.message}")
+            } finally {
+                if (profile !== probeProfile) runCatching { probeProfile?.close() }
+            }
+
+            if (now >= settleDeadlineMs) {
+                Log.w(TAG, "9eSIM ${name} did not report idle before the settle deadline")
+                settleDeadlineMs = 0L
+                nextSettleProbeMs = 0L
+                settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
+            } else {
+                nextSettleProbeMs = System.currentTimeMillis() + settleProbeGapMs
+                settleProbeGapMs = (settleProbeGapMs * 2).coerceAtMost(NBLE_SETTLE_MAX_PROBE_GAP_MS)
+            }
+            throw settlingException()
+        }
+
+        private fun settlingException(now: Long = System.currentTimeMillis()): BleCardSettlingException =
+                BleCardSettlingException((nextSettleProbeMs - now).coerceAtLeast(0L))
 
         fun disconnect() = synchronized(lock) {
             runCatching { profile?.close() }
@@ -238,6 +353,12 @@ class BleSmartcardService(
             if (response.size < 2) return null
             val sw1 = response[response.size - 2].toInt() and 0xff
             val sw2 = response.last().toInt() and 0xff
+            if (BleProtocolCodec.nbleCardState(response) in setOf(
+                            BleProtocolCodec.NbleCardState.PROACTIVE_REFRESH,
+                            BleProtocolCodec.NbleCardState.SETTLING
+                    )) {
+                throw BleCardSettlingException(NBLE_SETTLE_QUIET_MS)
+            }
             return if ((sw1 == 0x90 && sw2 == 0x00) || sw1 == 0x61) BleChannel(this, reader) else null
         }
     }
