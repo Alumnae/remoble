@@ -45,6 +45,16 @@ class BleSmartcardService(
         private val NBLE_STATUS_APDU = byteArrayOf(
                 0x80.toByte(), 0xF2.toByte(), 0x00, 0x00, 0x00
         )
+
+        private fun mapCla(cla: Byte, channel: Int): Byte {
+            require(channel in 0..19) { "Invalid logical channel $channel" }
+            val value = cla.toInt() and 0xff
+            return if (channel < 4) {
+                ((value and 0xfc) or channel).toByte()
+            } else {
+                ((value and 0xf0) or 0x40 or (channel - 4)).toByte()
+            }
+        }
     }
 
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -111,7 +121,7 @@ class BleSmartcardService(
      * open-channel fallback should decide that every candidate AID has failed.
      */
     fun reconnectReader(readerName: String): SmartcardSession? {
-        val reader = foundReaders.values.firstOrNull { it.name == readerName } ?: return null
+        val reader = findReader(readerName) ?: return null
         reader.throwIfSettling()
         Log.w(TAG, "Resetting GATT connection for $readerName")
         reader.disconnect()
@@ -122,20 +132,46 @@ class BleSmartcardService(
     }
 
     fun isReaderSettling(readerName: String): Boolean =
-            foundReaders.values.firstOrNull { it.name == readerName }?.isSettling() == true
+            findReader(readerName)?.isSettling() == true
+
+    /** Limits optional PSK discovery to actual 9eSIM advertisements, not every NBLE/TYBLE peer. */
+    fun isNineEsimReader(readerName: String): Boolean =
+            findReader(readerName)?.displayName?.startsWith("9eSIM", ignoreCase = true) == true
+
+    private fun findReader(readerName: String): BleReader? {
+        foundReaders.values.firstOrNull { it.name == readerName }?.let { return it }
+        val address = readerName.substringAfterLast('|', missingDelimiterValue = "")
+        return address.takeIf { it.isNotEmpty() }?.let { foundReaders[it.uppercase()] }
+    }
 
     private fun accept(result: ScanResult) {
         val advertised = result.scanRecord?.deviceName.orEmpty()
         val platform = runCatching { result.device.name.orEmpty() }.getOrDefault("")
-        val displayName = platform.ifBlank { advertised }.ifBlank { "BLE eUICC" }
+        // Android can cache an older six-character 9eSIM name. TYBLE/B1
+        // authentication needs the live advertised eight-digit UID.
+        val displayName = listOf(advertised, platform)
+                .firstOrNull(TybleProtocol::isDeviceName)
+                ?: platform.ifBlank { advertised }.ifBlank { "BLE eUICC" }
         val services = result.scanRecord?.serviceUuids.orEmpty().map(ParcelUuid::getUuid).toSet()
         val type = BleProfileFactory.detect(displayName, services) ?: return
 
-        val address = result.device.address
-        val readerName = "ble:$type:$displayName|$address"
+        val address = result.device.address.uppercase()
+        // The advertised name can change and is not an identity. Keep the
+        // RemoCard slot stable and unique by Bluetooth MAC.
+        val readerName = "ble:$type|$address"
         val existing = foundReaders[address]
         if (existing == null) {
             foundReaders[address] = BleReader(readerName, displayName, type, result.device)
+            executor.execute { onReadersChanged() }
+        } else if (existing.type != type ||
+                (type == BleProfileFactory.TYPE_TYBLE && existing.displayName != displayName)) {
+            // Migrate a previously remembered six-character/NBLE identity to
+            // the live eight-digit B1 advertisement before authenticating.
+            val wasRemembered = existing.remembered
+            existing.disconnect()
+            val replacement = BleReader(readerName, displayName, type, result.device)
+            foundReaders[address] = replacement
+            if (wasRemembered) remember(replacement)
             executor.execute { onReadersChanged() }
         } else {
             existing.lastSeen = System.currentTimeMillis()
@@ -155,12 +191,12 @@ class BleSmartcardService(
         prefs.getStringSet(PREF_REMEMBERED_READERS, emptySet()).orEmpty().forEach { encoded ->
             try {
                 val record = JSONObject(encoded)
-                val address = record.getString("address")
+                val address = record.getString("address").uppercase()
                 val displayName = record.getString("name")
                 val storedType = record.getString("type")
                 val type = BleProfileFactory.detect(displayName, emptySet()) ?: storedType
                 val device = bluetoothAdapter.getRemoteDevice(address)
-                val readerName = "ble:$type:$displayName|$address"
+                val readerName = "ble:$type|$address"
                 foundReaders[address] = BleReader(
                         readerName,
                         displayName,
@@ -179,7 +215,10 @@ class BleSmartcardService(
         reader.remembered = true
         val current = prefs.getStringSet(PREF_REMEMBERED_READERS, emptySet()).orEmpty().toMutableSet()
         current.removeAll { encoded ->
-            runCatching { JSONObject(encoded).optString("address") == reader.device.address }
+            runCatching {
+                JSONObject(encoded).optString("address")
+                        .equals(reader.device.address, ignoreCase = true)
+            }
                     .getOrDefault(false)
         }
         current += JSONObject()
@@ -237,6 +276,8 @@ class BleSmartcardService(
         fun transceive(command: ByteArray): ByteArray = synchronized(lock) {
             val active = profile ?: error("BLE reader is not connected")
             try {
+                val beeSimRefresh = type == BleProfileFactory.TYPE_BEESIM &&
+                        BleProtocolCodec.nbleRequestsProactiveRefresh(command)
                 if (type == BleProfileFactory.TYPE_NBLE &&
                         BleProtocolCodec.nbleRequestsProactiveRefresh(command)) {
                     profileSwitchRefreshPending = true
@@ -262,6 +303,13 @@ class BleSmartcardService(
                             if (sw1 != 0x61) profileSwitchRefreshPending = false
                         }
                     }
+                }
+                if (beeSimRefresh && BleProtocolCodec.nbleCardState(response) in setOf(
+                                BleProtocolCodec.NbleCardState.READY,
+                                BleProtocolCodec.NbleCardState.PROACTIVE_REFRESH
+                        ) && active.onProfileSwitchCommitted()) {
+                    if (profile === active) profile = null
+                    Log.i(TAG, "Reset BeeSIM ${name} after profile switch")
                 }
                 response
             } catch (error: Exception) {
@@ -349,7 +397,35 @@ class BleSmartcardService(
 
         override fun openLogicalChannel(aid: ByteArray): SmartcardChannel? {
             check(!closed) { "BLE session is closed" }
-            val response = reader.transceive(BleProtocolCodec.selectAid(aid))
+            // Match NekokoLPA2's BaseAdapter.openLogicalChannel path. A lost
+            // HTTP session can leave a physical channel allocated even though
+            // Remoble no longer has a handle for it.
+            for (channel in 1..3) {
+                runCatching {
+                    transceiveControl(byteArrayOf(0x00, 0x70, 0x80.toByte(), channel.toByte(), 0x00))
+                }
+            }
+            runCatching {
+                transceiveControl("80AA00000AA908810082010183010700".hexToBytes())
+            }
+
+            var channelNumber = 0
+            val manage = runCatching {
+                transceiveControl(byteArrayOf(0x00, 0x70, 0x00, 0x00, 0x00))
+            }.getOrNull()
+            if (manage != null && manage.size >= 3 &&
+                    manage[manage.size - 2] == 0x90.toByte() && manage.last() == 0x00.toByte()) {
+                val allocated = manage[0].toInt() and 0xff
+                if (allocated in 1..19) channelNumber = allocated
+            }
+
+            val select = BleProtocolCodec.selectAid(aid).also {
+                it[0] = mapCla(it[0], channelNumber)
+            }
+            // SELECT may return 61xx. Consume GET RESPONSE here just as
+            // NekokoLPA2's APDU transport does before reporting the channel
+            // as usable to the remote client.
+            val response = transceiveControl(select)
             if (response.size < 2) return null
             val sw1 = response[response.size - 2].toInt() and 0xff
             val sw2 = response.last().toInt() and 0xff
@@ -359,19 +435,62 @@ class BleSmartcardService(
                     )) {
                 throw BleCardSettlingException(NBLE_SETTLE_QUIET_MS)
             }
-            return if ((sw1 == 0x90 && sw2 == 0x00) || sw1 == 0x61) BleChannel(this, reader) else null
+            if ((sw1 == 0x90 && sw2 == 0x00) || sw1 == 0x61) {
+                return BleChannel(this, reader, channelNumber)
+            }
+            if (channelNumber > 0) {
+                runCatching {
+                    reader.transceive(byteArrayOf(0x00, 0x70, 0x80.toByte(), channelNumber.toByte(), 0x00))
+                }
+            }
+            return null
+        }
+
+        private fun transceiveControl(command: ByteArray): ByteArray {
+            var current = command
+            val output = java.io.ByteArrayOutputStream()
+            repeat(8) {
+                val response = reader.transceive(current)
+                require(response.size >= 2) { "Truncated BLE APDU response" }
+                val sw1 = response[response.size - 2].toInt() and 0xff
+                val sw2 = response.last().toInt() and 0xff
+                if (sw1 == 0x61) {
+                    output.write(response, 0, response.size - 2)
+                    current = byteArrayOf(current[0], 0xc0.toByte(), 0x00, 0x00, sw2.toByte())
+                    return@repeat
+                }
+                if (sw1 == 0x6c) {
+                    current = current.copyOf().also { corrected -> corrected[corrected.lastIndex] = sw2.toByte() }
+                    return@repeat
+                }
+                output.write(response)
+                return output.toByteArray()
+            }
+            error("BLE control response did not finish reassembling")
         }
     }
 
     private class BleChannel(
             override val session: SmartcardSession,
-            private val reader: BleReader
+            private val reader: BleReader,
+            private val channelNumber: Int
     ) : SmartcardChannel {
         @Volatile private var closed = false
         override fun transmit(command: ByteArray): ByteArray {
             check(!closed) { "BLE channel is closed" }
-            return reader.transceive(command)
+            val mapped = command.copyOf()
+            if (mapped.isNotEmpty()) mapped[0] = mapCla(mapped[0], channelNumber)
+            return reader.transceive(mapped)
         }
-        override fun close() { closed = true }
+        override fun close() {
+            if (closed) return
+            closed = true
+            if (channelNumber > 0) {
+                runCatching {
+                    reader.transceive(byteArrayOf(0x00, 0x70, 0x80.toByte(), channelNumber.toByte(), 0x00))
+                }
+            }
+        }
     }
+
 }

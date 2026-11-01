@@ -1,6 +1,6 @@
 # Remoble
 
-Android BLE-to-HTTP bridge for remote eUICC management from NekokoLPA2.
+Android and iOS BLE-to-HTTP bridge for remote eUICC management from NekokoLPA2.
 
 Remoble scans for a supported Bluetooth Low Energy eUICC reader, connects to it as a BLE
 central, translates ISO 7816 APDUs to the reader's GATT protocol, and exposes the existing
@@ -14,11 +14,22 @@ adapter.
 - SimLink / `eSIM_Writer` (Nordic UART Service, JSON APDU framing)
 - NBLE / 9eSIM and compatible GlocalMe readers (Nordic UART Service, authenticated binary APDU
   framing)
+- 9eSIM B1/B0 Plus and compatible Tianyu TYBLE cards (eight-digit UID,
+  ISSC UART framing and automatic device-derived authentication)
 - ESTKme (RED length-prefixed framing)
 - ESTKme RED (CCID-over-BLE framing)
+- BeeSIM (AE30 GATT service, MTU-aware indexed framing)
 
 The scanner also identifies devices by their advertised GATT service, so a reader does not
-have to expose a stable Bluetooth name. BeeSIM uses a different protocol and is not enabled yet.
+have to expose a stable Bluetooth name. BeeSIM connections apply the upstream command pacing,
+release a dropped GATT handle before reconnecting, and reset the writer after a profile switch.
+
+For the observed 9eSIM B0 download-authentication range, Android and iOS record the EID and
+one-time challenge, obtain the matching PSK from `https://key.9esim.com/psk`, store it with the
+platform secure keystore, and send BF71 immediately before `authenticateServer` on the already
+open logical channel. If the remote client already performs BF71, Remoble detects it and does not
+send a duplicate. Other 9eSIM/B1 identifiers are tried only when the service actually returns a
+valid PSK, so unrelated readers retain their normal path.
 
 ## Android and root
 
@@ -30,6 +41,19 @@ internal eUICC, OMAPI or Telephony APIs.
 If by “USB interno” you mean the phone's built-in Bluetooth controller, Android exposes it via
 the Bluetooth framework rather than as a USB device. An app cannot and does not need to claim
 that internal controller through `UsbManager`. External USB readers are a separate transport.
+
+## iOS
+
+The native Swift target is in [`ios/Remoble.xcodeproj`](ios/Remoble.xcodeproj). It uses
+CoreBluetooth for 9eSIM/NBLE and BeeSIM and Network.framework for the RemoCard HTTP endpoint.
+Open the project in Xcode, choose a signing team, and install it on a physical iPhone. The URL
+shown in the app can be added directly as a Remote / RemoCard reader in NekokoLPA2.
+
+iOS remembers the CoreBluetooth peripheral identifier and the NBLE PIN. It also mirrors the
+NekokoLPA2 2.2.x profile-switch behavior by releasing the 9eSIM connection for a quiet period,
+or restarting BeeSIM, before reconnecting. Keep Remoble in the foreground while NekokoLPA2 is
+using its HTTP endpoint; `bluetooth-central` background handling does not make an HTTP listener
+an always-running iOS service.
 
 ## Use from NekokoLPA2
 
@@ -70,7 +94,7 @@ standard Android debug key. To use a specific keystore, define `REMOBLE_SIGNING_
 ## Architecture
 
 ```text
-BLE eUICC reader <-> Android GATT <-> Remoble <-> RemoCard HTTP v2 <-> NekokoLPA2
+BLE eUICC reader <-> Android GATT / iOS CoreBluetooth <-> Remoble <-> RemoCard HTTP v2 <-> NekokoLPA2
 ```
 
 The original OMAPI implementation remains in the source tree for comparison, but the running

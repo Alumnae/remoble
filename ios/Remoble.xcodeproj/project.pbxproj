@@ -1,0 +1,256 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000001 /* RemobleApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* RemobleApp.swift */; };
+		A00000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* ContentView.swift */; };
+		A00000000000000000000003 /* Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* Hex.swift */; };
+		A00000000000000000000004 /* BLEProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000004 /* BLEProtocol.swift */; };
+		A00000000000000000000005 /* BLEBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000005 /* BLEBridge.swift */; };
+		A00000000000000000000006 /* RemoHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000006 /* RemoHTTPServer.swift */; };
+		A00000000000000000000007 /* BLEDeviceSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000009 /* BLEDeviceSession.swift */; };
+		A00000000000000000000008 /* BackgroundAudioKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000010 /* BackgroundAudioKeeper.swift */; };
+		A00000000000000000000009 /* WhiteNoiseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000011 /* WhiteNoiseView.swift */; };
+		A00000000000000000000010 /* HTTPPasswordStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000012 /* HTTPPasswordStore.swift */; };
+		A00000000000000000000011 /* BLEAdditionalProfiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000013 /* BLEAdditionalProfiles.swift */; };
+		A00000000000000000000012 /* NineEsimCardAuthenticator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* NineEsimCardAuthenticator.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B00000000000000000000001 /* RemobleApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemobleApp.swift; sourceTree = "<group>"; };
+		B00000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		B00000000000000000000003 /* Hex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hex.swift; sourceTree = "<group>"; };
+		B00000000000000000000004 /* BLEProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEProtocol.swift; sourceTree = "<group>"; };
+		B00000000000000000000005 /* BLEBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEBridge.swift; sourceTree = "<group>"; };
+		B00000000000000000000006 /* RemoHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoHTTPServer.swift; sourceTree = "<group>"; };
+		B00000000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B00000000000000000000008 /* Remoble.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Remoble.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00000000000000000000009 /* BLEDeviceSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEDeviceSession.swift; sourceTree = "<group>"; };
+		B00000000000000000000010 /* BackgroundAudioKeeper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundAudioKeeper.swift; sourceTree = "<group>"; };
+		B00000000000000000000011 /* WhiteNoiseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhiteNoiseView.swift; sourceTree = "<group>"; };
+		B00000000000000000000012 /* HTTPPasswordStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPPasswordStore.swift; sourceTree = "<group>"; };
+		B00000000000000000000013 /* BLEAdditionalProfiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEAdditionalProfiles.swift; sourceTree = "<group>"; };
+		B00000000000000000000014 /* NineEsimCardAuthenticator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NineEsimCardAuthenticator.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F00000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		C00000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				C00000000000000000000002 /* Remoble */,
+				C00000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		C00000000000000000000002 /* Remoble */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000001 /* RemobleApp.swift */,
+				B00000000000000000000002 /* ContentView.swift */,
+				B00000000000000000000003 /* Hex.swift */,
+				B00000000000000000000004 /* BLEProtocol.swift */,
+				B00000000000000000000005 /* BLEBridge.swift */,
+				B00000000000000000000009 /* BLEDeviceSession.swift */,
+				B00000000000000000000010 /* BackgroundAudioKeeper.swift */,
+				B00000000000000000000011 /* WhiteNoiseView.swift */,
+				B00000000000000000000012 /* HTTPPasswordStore.swift */,
+				B00000000000000000000013 /* BLEAdditionalProfiles.swift */,
+				B00000000000000000000014 /* NineEsimCardAuthenticator.swift */,
+				B00000000000000000000006 /* RemoHTTPServer.swift */,
+				B00000000000000000000007 /* Info.plist */,
+			);
+			path = Remoble;
+			sourceTree = "<group>";
+		};
+		C00000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000008 /* Remoble.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		D00000000000000000000001 /* Remoble */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E00000000000000000000002 /* Build configuration list for PBXNativeTarget "Remoble" */;
+			buildPhases = (
+				F00000000000000000000001 /* Sources */,
+				F00000000000000000000002 /* Frameworks */,
+				F00000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Remoble;
+			productName = Remoble;
+			productReference = B00000000000000000000008 /* Remoble.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D00000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2710;
+				LastUpgradeCheck = 2710;
+				TargetAttributes = {
+					D00000000000000000000001 = {
+						CreatedOnToolsVersion = 27.1;
+					};
+				};
+			};
+			buildConfigurationList = E00000000000000000000001 /* Build configuration list for PBXProject "Remoble" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = C00000000000000000000001;
+			productRefGroup = C00000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D00000000000000000000001 /* Remoble */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F00000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F00000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000001 /* RemobleApp.swift in Sources */,
+				A00000000000000000000002 /* ContentView.swift in Sources */,
+				A00000000000000000000003 /* Hex.swift in Sources */,
+				A00000000000000000000004 /* BLEProtocol.swift in Sources */,
+				A00000000000000000000005 /* BLEBridge.swift in Sources */,
+				A00000000000000000000006 /* RemoHTTPServer.swift in Sources */,
+				A00000000000000000000007 /* BLEDeviceSession.swift in Sources */,
+				A00000000000000000000008 /* BackgroundAudioKeeper.swift in Sources */,
+				A00000000000000000000009 /* WhiteNoiseView.swift in Sources */,
+				A00000000000000000000010 /* HTTPPasswordStore.swift in Sources */,
+				A00000000000000000000011 /* BLEAdditionalProfiles.swift in Sources */,
+				A00000000000000000000012 /* NineEsimCardAuthenticator.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		E10000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		E10000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		E10000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = V7ZP3EHBL7;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Remoble/Info.plist;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ee.nekoko.remoble.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		E10000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = V7ZP3EHBL7;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Remoble/Info.plist;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ee.nekoko.remoble.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		E00000000000000000000001 /* Build configuration list for PBXProject "Remoble" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E10000000000000000000001 /* Debug */,
+				E10000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E00000000000000000000002 /* Build configuration list for PBXNativeTarget "Remoble" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E10000000000000000000003 /* Debug */,
+				E10000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D00000000000000000000002 /* Project object */;
+}

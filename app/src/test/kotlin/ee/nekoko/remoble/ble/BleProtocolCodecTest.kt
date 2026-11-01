@@ -46,7 +46,26 @@ class BleProtocolCodecTest {
                 )
         )
         assertEquals(BleProfileFactory.TYPE_NBLE, BleProfileFactory.detect("9eSIM888888", emptySet()))
+        assertEquals(BleProfileFactory.TYPE_TYBLE, BleProfileFactory.detect("9eSIM00000184", emptySet()))
+        assertEquals(BleProfileFactory.TYPE_TYBLE, BleProfileFactory.detect("TES-BT-00000184", emptySet()))
         assertEquals(BleProfileFactory.TYPE_SIMLINK, BleProfileFactory.detect("eSIM_Writer", emptySet()))
+        assertEquals(BleProfileFactory.TYPE_BEESIM, BleProfileFactory.detect("BeeSIM", emptySet()))
+        assertEquals(
+                BleProfileFactory.TYPE_BEESIM,
+                BleProfileFactory.detect("unknown", setOf(UUID.fromString("0000ae30-0000-1000-8000-00805f9b34fb")))
+        )
+    }
+
+    @Test
+    fun tybleB1AuthenticationAndFramingMatchUpstreamVectors() {
+        assertEquals("00000184", TybleProtocol.uidFromDeviceName("9eSIM00000184"))
+        assertEquals("858504", String(TybleProtocol.pinForDeviceName("9eSIM00000184"), Charsets.US_ASCII))
+        assertEquals("ff605a0106333230343336",
+                TybleProtocol.authenticationApdu("SCT-BT-49535343").toHex())
+        val frame = TybleProtocol.frame("9000".hexToBytes())
+        assertEquals("00029000", frame.toHex())
+        assertEquals(4, TybleProtocol.frameLength(frame))
+        assertArrayEquals("9000".hexToBytes(), TybleProtocol.payload(frame))
     }
 
     @Test
@@ -101,6 +120,34 @@ class BleProtocolCodecTest {
         assertTrue(BleProtocolCodec.nbleRequestsProactiveRefresh(disable))
         assertFalse(BleProtocolCodec.nbleRequestsProactiveRefresh(noRefresh))
         assertFalse(BleProtocolCodec.nbleRequestsProactiveRefresh(unrelated))
+    }
+
+    @Test
+    fun beeSimFramesRoundTripAtNegotiatedMtu() {
+        val payload = ByteArray(500) { (it and 0xff).toByte() }
+        val frames = BleProtocolCodec.beeSimFrames(payload, 242)
+
+        assertEquals(3, frames.size)
+        assertTrue(frames.all { it.size <= 244 })
+        assertEquals(1, frames.first()[1].toInt())
+        assertEquals(3, frames.last()[1].toInt())
+        assertArrayEquals(payload, BleProtocolCodec.decodeBeeSimFrames(frames))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun beeSimRejectsOutOfOrderResponseFrames() {
+        BleProtocolCodec.decodeBeeSimFrames(
+                listOf(byteArrayOf(2, 1, 0x11), byteArrayOf(2, 3, 0x22))
+        )
+    }
+
+    @Test
+    fun beeSimPacerCoolsDownBeforeCommandTwentyTwo() {
+        val delays = mutableListOf<Long>()
+        val pacer = BeeSimCommandPacer(delays::add)
+        repeat(21) { assertFalse(pacer.beforeCommand()) }
+        assertTrue(pacer.beforeCommand())
+        assertEquals(listOf(1_200L), delays)
     }
 
     @Test

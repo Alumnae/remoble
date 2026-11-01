@@ -51,6 +51,11 @@ internal class GattClient(private val context: Context, private val device: Blue
                 servicesOperation.fail(error)
                 writeOperation?.fail(error)
                 descriptorOperation?.fail(error)
+                // Release the native handle immediately. Keeping a dead GATT object around can
+                // silently reclaim a BeeSIM as it reboots, preventing it from advertising for
+                // the fresh connection used by the recovery retry.
+                g.close()
+                if (g === gatt) gatt = null
             }
         }
 
@@ -117,13 +122,21 @@ internal class GattClient(private val context: Context, private val device: Blue
     fun service(uuid: UUID): BluetoothGattService =
             gatt?.getService(uuid) ?: error("BLE service $uuid not found")
 
+    fun characteristics(): List<BluetoothGattCharacteristic> =
+            gatt?.services?.flatMap { it.characteristics }.orEmpty()
+
     fun enableNotifications(characteristic: BluetoothGattCharacteristic) {
         check(gatt?.setCharacteristicNotification(characteristic, true) == true) {
             "Unable to enable local BLE notifications"
         }
         val descriptor = characteristic.getDescriptor(CLIENT_CONFIGURATION)
                 ?: error("Client configuration descriptor not found for ${characteristic.uuid}")
-        val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        val value =
+                if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                }
         descriptorOperation = PendingOperation()
         val started = if (Build.VERSION.SDK_INT >= 33) {
             gatt!!.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
@@ -158,6 +171,7 @@ internal class GattClient(private val context: Context, private val device: Blue
             value: ByteArray,
             maxChunkSize: Int = 240
     ) {
+        check(!disconnected) { "BLE device is disconnected" }
         val chunkSize = (mtu - 3).coerceIn(20, maxChunkSize)
         value.asList().chunked(chunkSize).forEach { chunk ->
             writeChunk(characteristic, chunk.toByteArray())
@@ -168,7 +182,8 @@ internal class GattClient(private val context: Context, private val device: Blue
     fun exchange(
             characteristic: BluetoothGattCharacteristic,
             request: ByteArray,
-            expectedLength: (ByteArray) -> Int?
+            expectedLength: (ByteArray) -> Int?,
+            timeoutSeconds: Long = TIMEOUT_SECONDS
     ): ByteArray {
         check(!disconnected) { "BLE device is disconnected" }
         notifications.clear()
@@ -178,7 +193,7 @@ internal class GattClient(private val context: Context, private val device: Blue
         }
 
         val output = ByteArrayOutputStream()
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
         while (System.nanoTime() < deadline) {
             val remaining = deadline - System.nanoTime()
             val part = notifications.poll(remaining, TimeUnit.NANOSECONDS)
@@ -214,7 +229,14 @@ internal class GattClient(private val context: Context, private val device: Blue
             gatt!!.writeCharacteristic(characteristic)
         }
         check(started) { "Unable to start BLE characteristic write" }
-        writeOperation!!.await("characteristic write")
+        if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+            // There is no portable callback guarantee for a write-without-response. The
+            // reference BeeSIM client leaves a short controller-queue gap instead.
+            writeOperation = null
+            Thread.sleep(8)
+        } else {
+            writeOperation!!.await("characteristic write")
+        }
     }
 
     override fun close() {

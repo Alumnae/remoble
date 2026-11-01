@@ -6,6 +6,10 @@ local.properties
 .DS_Store
 capture/
 *.apk
+*.ipa
+*.tipa
 *.jks
 app/build/
 outputs/
+ios/build/
+ios/**/xcuserdata/

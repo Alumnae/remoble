@@ -12,6 +12,7 @@ import android.util.Base64
 import android.util.Log
 import ee.nekoko.remoble.ble.BleSmartcardService
 import ee.nekoko.remoble.ble.BleCardSettlingException
+import ee.nekoko.remoble.ble.NineEsimBf71
 import ee.nekoko.remoble.omapi.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -27,6 +28,7 @@ import io.ktor.server.routing.*
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -95,6 +97,12 @@ data class OpenChannelResponse(
         val reader: String? = null
 )
 
+private data class CardAuthorizationState(
+        var eid: String? = null,
+        var challenge: ByteArray? = null,
+        var authorized: Boolean = false
+)
+
 @Serializable data class ListSlotsResponse(val slots: List<SlotInfo>)
 
 @Serializable data class ListChannelsResponse(val channels: List<String>)
@@ -112,6 +120,9 @@ class RemoService : Service() {
     private var smartcardService: SmartcardService? = null
     private val activeSessions = mutableMapOf<String, SmartcardSession>()
     private val activeChannels = mutableMapOf<String, SmartcardChannel>() // Key: "reader:aid"
+    private val cardAuthorizationStates =
+            java.util.concurrent.ConcurrentHashMap<String, CardAuthorizationState>()
+    private lateinit var cardPskProvider: NineEsimPskProvider
 
     private var currentPort = 33777
     private var currentPassword = ""
@@ -176,6 +187,7 @@ class RemoService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
+        cardPskProvider = NineEsimPskProvider(this)
         loadSettings()
         selectAvailablePort()
         acquireWakeLock()
@@ -624,8 +636,15 @@ class RemoService : Service() {
                                                             session.openLogicalChannel(aidBytes)
                                                     if (openedChannel != null) {
                                                         matchedAid = aid
-                                                        activeChannels["${reader.name}:$aid"] =
+                                                        val channelKey = "${reader.name}:$aid"
+                                                        activeChannels[channelKey] =
                                                                 openedChannel!!
+                                                        cardAuthorizationStates.put(
+                                                                channelKey,
+                                                                CardAuthorizationState(
+                                                                        eid = slotEids[reader.name]
+                                                                )
+                                                        )?.challenge?.fill(0)
                                                         Log.i(
                                                                 TAG,
                                                                 "Successfully opened channel for AID: $aid"
@@ -721,7 +740,13 @@ class RemoService : Service() {
                                         }
 
                                         val command = hexToBytes(req.apdu)
-                                        val response = transmitWithChunking(channel, command)
+                                        val response =
+                                                transmitCardAware(
+                                                        readerName,
+                                                        aid,
+                                                        channel,
+                                                        command
+                                                )
                                         call.respondMaybeEncrypted(
                                                 TransmitResponse(bytesToHex(response))
                                         )
@@ -820,7 +845,9 @@ class RemoService : Service() {
                                     val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
 
                                     req.aids.forEach { aid ->
-                                        activeChannels.remove("$readerName:$aid")?.close()
+                                        val channelKey = "$readerName:$aid"
+                                        activeChannels.remove(channelKey)?.close()
+                                        cardAuthorizationStates.remove(channelKey)?.challenge?.fill(0)
                                     }
                                     call.respondMaybeEncrypted(SuccessResponse(true))
                                 } catch (e: Exception) {
@@ -910,6 +937,115 @@ class RemoService : Service() {
         return fullResponse.toByteArray()
     }
 
+    /**
+     * Observes the standard ES10b exchange and inserts BF71 immediately before authenticateServer.
+     * A client that already sends BF71 remains authoritative and is never authenticated twice.
+     */
+    private suspend fun transmitCardAware(
+            readerName: String,
+            aid: String,
+            channel: SmartcardChannel,
+            command: ByteArray
+    ): ByteArray {
+        val channelKey = "$readerName:$aid"
+        val state =
+                cardAuthorizationStates.getOrPut(channelKey) {
+                    CardAuthorizationState(eid = slotEids[readerName])
+                }
+
+        if (NineEsimBf71.isAuthenticateServer(command)) {
+            if (state.authorized) {
+                // The remote client already sent BF71 for this one-time
+                // challenge. Consume the marker and forward BF38 unchanged.
+                state.authorized = false
+                return transmitWithChunking(channel, command)
+            }
+            val eid = state.eid ?: slotEids[readerName]
+            val required = NineEsimBf71.requiresAuthorization(eid)
+            val eligible =
+                    required ||
+                            (NineEsimBf71.isValidEid(eid) &&
+                                    (smartcardService as? BleSmartcardService)
+                                            ?.isNineEsimReader(readerName) == true)
+            val challenge = state.challenge
+            // Consume the challenge before any network or card operation. Retrying the same
+            // authenticateServer request must not replay a card authorization APDU.
+            state.challenge = null
+
+            if (eligible) {
+                if (challenge == null) {
+                    if (required) {
+                        error("Card authorization session is incomplete; restart the download")
+                    }
+                } else {
+                    try {
+                        val psk = try {
+                            cardPskProvider.load(eid!!)
+                        } catch (error: Exception) {
+                            if (required) throw error
+                            Log.w(TAG, "Optional card authorization key lookup failed", error)
+                            null
+                        }
+
+                        if (psk == null) {
+                            if (required) error("Card authorization key is unavailable")
+                        } else {
+                            try {
+                                val nonce = ByteArray(16).also(SecureRandom()::nextBytes)
+                                val authorization = NineEsimBf71.buildApdu(psk, challenge, nonce)
+                                nonce.fill(0)
+                                val authorizationResponse =
+                                        transmitWithChunking(channel, authorization)
+                                if (!NineEsimBf71.isSuccess(authorizationResponse)) {
+                                    error(
+                                            "Card BF71 authorization failed (SW=${statusWord(authorizationResponse)})"
+                                    )
+                                }
+                                Log.i(TAG, "Applied card authorization for $readerName")
+                            } finally {
+                                psk.fill(0)
+                            }
+                        }
+                    } finally {
+                        challenge.fill(0)
+                    }
+                }
+            } else {
+                challenge?.fill(0)
+            }
+        }
+
+        val response = transmitWithChunking(channel, command)
+        when {
+            NineEsimBf71.isGetEid(command) -> {
+                NineEsimBf71.extractEid(response)?.let { eid ->
+                    state.eid = eid
+                    slotEids[readerName] = eid
+                }
+            }
+            NineEsimBf71.isGetChallenge(command) -> {
+                state.challenge?.fill(0)
+                state.challenge = NineEsimBf71.extractChallenge(response)
+                state.authorized = false
+            }
+            NineEsimBf71.isAuthorization(command) && NineEsimBf71.isSuccess(response) -> {
+                // New clients may already contain the GM/B0 plugin. Do not inject a second BF71
+                // when their subsequent authenticateServer APDU arrives.
+                state.challenge?.fill(0)
+                state.challenge = null
+                state.authorized = true
+            }
+            NineEsimBf71.isAuthenticateServer(command) -> {
+                state.authorized = false
+            }
+        }
+        return response
+    }
+
+    private fun statusWord(response: ByteArray): String =
+            if (response.size < 2) "truncated"
+            else "%02X%02X".format(response[response.size - 2], response.last())
+
     private fun isReaderAllowed(readerName: String): Boolean {
         val allowed = allowedReaders ?: return true
         if (readerName in allowed) return true
@@ -953,6 +1089,8 @@ class RemoService : Service() {
             } catch (e: Exception) {}
         }
         activeChannels.clear()
+        cardAuthorizationStates.values.forEach { it.challenge?.fill(0) }
+        cardAuthorizationStates.clear()
         activeSessions.values.forEach {
             try {
                 it.close()
@@ -971,6 +1109,11 @@ class RemoService : Service() {
                 channelIterator.remove()
             }
         }
+        cardAuthorizationStates.keys
+                .filter { it.startsWith(prefix) }
+                .forEach { key ->
+                    cardAuthorizationStates.remove(key)?.challenge?.fill(0)
+                }
         activeSessions.remove(readerName)?.let { runCatching { it.close() } }
     }
 

@@ -3,6 +3,53 @@ package ee.nekoko.remoble.ble
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+internal object TybleProtocol {
+    private val DEVICE_NAME = Regex(
+            "^(?:[A-Za-z0-9]+-BT-([0-9A-Fa-f]{8})|9eSIM([0-9]{8}))$",
+            RegexOption.IGNORE_CASE
+    )
+
+    fun isDeviceName(name: String): Boolean = DEVICE_NAME.matches(name.trim())
+
+    fun uidFromDeviceName(name: String): String {
+        val match = DEVICE_NAME.matchEntire(name.trim())
+                ?: throw IllegalArgumentException("TYBLE device name does not contain an eight-character UID")
+        return (match.groupValues[1].ifEmpty { match.groupValues[2] }).uppercase()
+    }
+
+    fun pinForDeviceName(name: String): ByteArray {
+        val uid = uidFromDeviceName(name)
+        val bytes = uid.chunked(2).map { it.toInt(16) }
+        val sum = bytes.fold(0) { value, byte -> (value + byte) and 0xff }
+        val xor = bytes.fold(0) { value, byte -> value xor byte }
+        val mixed = (sum + xor) and 0xff
+        return listOf(sum, xor, mixed).flatMap { value ->
+            listOf(asciiDigit(value ushr 4), asciiDigit(value and 0x0f))
+        }.toByteArray()
+    }
+
+    fun authenticationApdu(name: String): ByteArray =
+            byteArrayOf(0xff.toByte(), 0x60, 0x5a, 0x01, 0x06) + pinForDeviceName(name)
+
+    fun frame(payload: ByteArray): ByteArray {
+        require(payload.size <= 0xffff) { "TYBLE command is too large" }
+        return byteArrayOf((payload.size ushr 8).toByte(), payload.size.toByte()) + payload
+    }
+
+    fun frameLength(bytes: ByteArray): Int? =
+            if (bytes.size < 2) null else 2 + ((bytes[0].toInt() and 0xff) shl 8) +
+                    (bytes[1].toInt() and 0xff)
+
+    fun payload(frame: ByteArray): ByteArray {
+        val length = frameLength(frame) ?: error("Truncated TYBLE response")
+        require(frame.size >= length) { "Truncated TYBLE response" }
+        return frame.copyOfRange(2, length)
+    }
+
+    private fun asciiDigit(nibble: Int): Byte =
+            (0x30 + if (nibble <= 9) nibble else nibble - 6).toByte()
+}
+
 internal object BleProtocolCodec {
     data class NbleResponse(val counter: Int, val apdu: ByteArray)
 
@@ -89,6 +136,32 @@ internal object BleProtocolCodec {
             value = (value shl 8) or (bytes[offset + 1 + index].toInt() and 0xff)
         }
         return value to (offset + 1 + count)
+    }
+
+    fun beeSimFrames(payload: ByteArray, framePayloadSize: Int): List<ByteArray> {
+        require(framePayloadSize > 0) { "BeeSIM frame payload must be positive" }
+        val total = if (payload.isEmpty()) 1 else (payload.size + framePayloadSize - 1) / framePayloadSize
+        require(total <= 255) { "BeeSIM command needs more than 255 frames" }
+        return (0 until total).map { index ->
+            val start = index * framePayloadSize
+            val end = (start + framePayloadSize).coerceAtMost(payload.size)
+            byteArrayOf(total.toByte(), (index + 1).toByte()) + payload.copyOfRange(start, end)
+        }
+    }
+
+    fun decodeBeeSimFrames(frames: List<ByteArray>): ByteArray {
+        require(frames.isNotEmpty()) { "Missing BeeSIM response" }
+        val total = frames.first().firstOrNull()?.toInt()?.and(0xff)
+                ?: error("Empty BeeSIM response frame")
+        require(total == frames.size && total > 0) { "Incomplete BeeSIM response" }
+        val output = ArrayList<Byte>()
+        frames.forEachIndexed { index, frame ->
+            require(frame.size >= 2) { "Truncated BeeSIM response frame" }
+            require((frame[0].toInt() and 0xff) == total) { "BeeSIM frame-count mismatch" }
+            require((frame[1].toInt() and 0xff) == index + 1) { "BeeSIM frame sequence mismatch" }
+            output.addAll(frame.copyOfRange(2, frame.size).toList())
+        }
+        return output.toByteArray()
     }
 
     fun selectAid(aid: ByteArray): ByteArray {

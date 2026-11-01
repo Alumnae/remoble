@@ -3,19 +3,26 @@ package ee.nekoko.remoble.ble
 import android.bluetooth.BluetoothGattCharacteristic
 import org.json.JSONObject
 import java.util.UUID
+import java.util.Timer
+import java.util.TimerTask
 
 internal interface BleProfile : AutoCloseable {
     fun connect()
     fun transmit(apdu: ByteArray): ByteArray
+    fun onProfileSwitchCommitted(): Boolean = false
 }
 
 internal object BleProfileFactory {
     const val TYPE_NBLE = "nble"
+    const val TYPE_TYBLE = "tyble"
     const val TYPE_SIMLINK = "simlink"
     const val TYPE_RED = "red"
     const val TYPE_RED_2 = "red2"
+    const val TYPE_BEESIM = "beesim"
     private val NUS_SERVICE = uuid("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    private val TYBLE_SERVICE = uuid("49535343-fe7d-4ae5-8fa9-9fafd205e455")
     private val RED_SERVICE = uuid16("4553")
+    private val BEESIM_SERVICE = uuid16("ae30")
     private val NINE_ESIM_NAME = Regex("^9esim[0-9a-f]{6}$", RegexOption.IGNORE_CASE)
 
     fun supports(name: String, advertisedServices: Set<UUID>): Boolean {
@@ -25,6 +32,8 @@ internal object BleProfileFactory {
     fun detect(name: String, advertisedServices: Set<UUID>): String? {
         val lower = name.lowercase()
         return when {
+            TybleProtocol.isDeviceName(name) || TYBLE_SERVICE in advertisedServices -> TYPE_TYBLE
+            lower.contains("beesim") || BEESIM_SERVICE in advertisedServices -> TYPE_BEESIM
             lower.contains("estkme red") -> TYPE_RED_2
             NINE_ESIM_NAME.matches(name.trim()) || lower.contains("glocal") -> TYPE_NBLE
             lower.contains("estkme") || RED_SERVICE in advertisedServices -> TYPE_RED
@@ -41,13 +50,174 @@ internal object BleProfileFactory {
     ): BleProfile = when (type) {
         TYPE_RED_2 -> RedCcidProfile(client)
         TYPE_RED -> RedProfile(client)
+        TYPE_BEESIM -> BeeSimProfile(client)
         TYPE_NBLE -> NbleProfile(client, displayName, configuredPin)
+        TYPE_TYBLE -> TybleProfile(client, displayName)
         TYPE_SIMLINK -> SimLinkProfile(client)
         else -> error("Unsupported BLE reader type: $type")
     }
 
     fun uuid(value: String): UUID = UUID.fromString(value)
     fun uuid16(value: String): UUID = uuid("0000${value.lowercase()}-0000-1000-8000-00805f9b34fb")
+}
+
+private class TybleProfile(
+        private val client: GattClient,
+        private val displayName: String
+) : BleProfile {
+    private val serviceUuid = BleProfileFactory.uuid("49535343-fe7d-4ae5-8fa9-9fafd205e455")
+    private val notifyUuid = BleProfileFactory.uuid("49535343-1e4d-4bd9-ba61-23c647249616")
+    private val writeUuid = BleProfileFactory.uuid("49535343-8841-43f4-a8d4-ecbe34729bb3")
+    private lateinit var tx: BluetoothGattCharacteristic
+
+    override fun connect() {
+        client.connect()
+        val service = client.service(serviceUuid)
+        tx = service.getCharacteristic(writeUuid) ?: error("TYBLE write characteristic not found")
+        val rx = service.getCharacteristic(notifyUuid) ?: error("TYBLE notify characteristic not found")
+        client.clearNotifications()
+        client.enableNotifications(rx)
+        val response = exchange(TybleProtocol.authenticationApdu(displayName), 10)
+        when (response.toHex().uppercase()) {
+            "9000" -> Unit
+            "6982" -> error("TYBLE authentication rejected (SW=6982)")
+            else -> error("TYBLE authentication failed (SW=${response.toHex().uppercase()})")
+        }
+    }
+
+    @Synchronized
+    override fun transmit(apdu: ByteArray): ByteArray = exchange(apdu, 100)
+
+    private fun exchange(payload: ByteArray, timeoutSeconds: Long): ByteArray {
+        val frame = client.exchange(
+                tx,
+                TybleProtocol.frame(payload),
+                TybleProtocol::frameLength,
+                timeoutSeconds
+        )
+        return TybleProtocol.payload(frame)
+    }
+
+    override fun close() = client.close()
+}
+
+internal class BeeSimCommandPacer(
+        private val sleeper: (Long) -> Unit = Thread::sleep
+) {
+    companion object {
+        const val COMMANDS_PER_BURST = 21
+        const val COOLDOWN_MS = 1_200L
+    }
+
+    private var commandsSinceCooldown = 0
+
+    fun beforeCommand(): Boolean {
+        if (commandsSinceCooldown >= COMMANDS_PER_BURST) {
+            sleeper(COOLDOWN_MS)
+            commandsSinceCooldown = 1
+            return true
+        }
+        commandsSinceCooldown++
+        return false
+    }
+
+    fun reset() {
+        commandsSinceCooldown = 0
+    }
+}
+
+private class BeeSimProfile(private val client: GattClient) : BleProfile {
+    companion object {
+        private val TX_UUID = BleProfileFactory.uuid16("ae01")
+        private val RX_UUID = BleProfileFactory.uuid16("ae02")
+        private val SET_POWER = "A03E040000".hexToBytes()
+        private val RESET = "A03F000000".hexToBytes()
+        private const val MAX_FRAME_LENGTH = 244
+    }
+
+    private lateinit var tx: BluetoothGattCharacteristic
+    private val pacer = BeeSimCommandPacer()
+
+    override fun connect() {
+        client.connect()
+        val characteristics = client.characteristics()
+        fun BluetoothGattCharacteristic.canWrite(): Boolean =
+                properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                        properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+        fun BluetoothGattCharacteristic.canNotify(): Boolean =
+                properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
+                        properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+
+        tx = characteristics.firstOrNull { it.uuid == TX_UUID && it.canWrite() }
+                ?: characteristics.firstOrNull { it.canWrite() }
+                ?: error("BeeSIM write characteristic not found")
+        val rx = characteristics.firstOrNull { it.uuid == RX_UUID && it.canNotify() }
+                ?: characteristics.firstOrNull { it !== tx && it.canNotify() }
+                ?: error("BeeSIM notify characteristic not found")
+
+        client.clearNotifications()
+        client.enableNotifications(rx)
+        Thread.sleep(200)
+        pacer.reset()
+        exchange(SET_POWER)
+    }
+
+    @Synchronized
+    override fun transmit(apdu: ByteArray): ByteArray = exchange(apdu)
+
+    private fun exchange(command: ByteArray): ByteArray {
+        pacer.beforeCommand()
+        client.clearNotifications()
+        writeFrames(command)
+
+        val frames = mutableListOf<ByteArray>()
+        var expectedTotal = -1
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(100)
+        while (expectedTotal < 0 || frames.size < expectedTotal) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) throw java.util.concurrent.TimeoutException("BeeSIM response timeout")
+            val remainingSeconds = java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toSeconds(remaining).coerceAtLeast(1)
+            val frame = client.awaitNotification(remainingSeconds)
+            require(frame.size >= 2) { "Truncated BeeSIM response frame" }
+            val total = frame[0].toInt() and 0xff
+            val index = frame[1].toInt() and 0xff
+            if (expectedTotal < 0) expectedTotal = total
+            require(total == expectedTotal && index == frames.size + 1) {
+                "BeeSIM response frame mismatch"
+            }
+            frames += frame
+        }
+        return BleProtocolCodec.decodeBeeSimFrames(frames)
+    }
+
+    private fun writeFrames(command: ByteArray) {
+        val frameLength = (client.mtu - 3).coerceIn(20, MAX_FRAME_LENGTH)
+        val framePayload = frameLength - 2
+        val frames = BleProtocolCodec.beeSimFrames(command, framePayload)
+        frames.forEachIndexed { index, frame ->
+            // A BeeSIM frame must be delivered by one ATT write. Splitting after adding the
+            // [total,index] header makes the peripheral interpret the fragments as new frames.
+            client.writeValue(tx, frame, maxChunkSize = frameLength)
+            val usesWriteResponse =
+                    tx.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            if (usesWriteResponse && index < frames.lastIndex) Thread.sleep(10)
+        }
+    }
+
+    override fun onProfileSwitchCommitted(): Boolean {
+        runCatching {
+            pacer.beforeCommand()
+            client.clearNotifications()
+            writeFrames(RESET)
+        }
+        // The writer normally drops the link while rebooting. Release the Android GATT handle
+        // immediately so the next Nekoko retry creates a genuinely fresh connection.
+        client.close()
+        return true
+    }
+
+    override fun close() = client.close()
 }
 
 private class NbleProfile(
@@ -62,6 +232,9 @@ private class NbleProfile(
             ?: NbleAuth.defaultPasswordForDeviceName(displayName)
     private lateinit var tx: BluetoothGattCharacteristic
     private var nextCounter = 0
+    private val idleTimer = Timer("remoble-nble-idle", true)
+    private var idleTask: TimerTask? = null
+    @Volatile private var closed = false
 
     override fun connect() {
         var switchedMode = false
@@ -132,27 +305,47 @@ private class NbleProfile(
 
     @Synchronized
     override fun transmit(apdu: ByteArray): ByteArray {
-        val counter = nextCounter
-        nextCounter = (nextCounter + 1) and 0xff
-        client.clearNotifications()
-        BleProtocolCodec.nbleFrames(counter, apdu).forEach { frame ->
-            client.writeValue(tx, frame, maxChunkSize = 101)
-        }
+        idleTask?.cancel()
+        try {
+            val counter = nextCounter
+            nextCounter = (nextCounter + 1) and 0xff
+            client.clearNotifications()
+            BleProtocolCodec.nbleFrames(counter, apdu).forEach { frame ->
+                client.writeValue(tx, frame, maxChunkSize = 101)
+            }
 
-        val responseFrames = mutableListOf<ByteArray>()
-        do {
-            val frame = client.awaitNotification(30)
-            responseFrames += frame
-        } while ((frame[0].toInt() and 0x20) == 0)
+            val responseFrames = mutableListOf<ByteArray>()
+            do {
+                val frame = client.awaitNotification(30)
+                responseFrames += frame
+            } while ((frame[0].toInt() and 0x20) == 0)
 
-        val response = BleProtocolCodec.decodeNbleFrames(responseFrames)
-        check(response.counter == counter) {
-            "NBLE response counter mismatch: expected $counter, received ${response.counter}"
+            val response = BleProtocolCodec.decodeNbleFrames(responseFrames)
+            check(response.counter == counter) {
+                "NBLE response counter mismatch: expected $counter, received ${response.counter}"
+            }
+            return response.apdu
+        } finally {
+            scheduleIdlePing()
         }
-        return response.apdu
     }
 
-    override fun close() = client.close()
+    private fun scheduleIdlePing() {
+        idleTask?.cancel()
+        if (closed) return
+        idleTask = object : TimerTask() {
+            override fun run() {
+                if (!closed) runCatching { transmit("99980000FB0000".hexToBytes()) }
+            }
+        }.also { idleTimer.schedule(it, 12_000) }
+    }
+
+    override fun close() {
+        closed = true
+        idleTask?.cancel()
+        idleTimer.cancel()
+        client.close()
+    }
 }
 
 private class SimLinkProfile(private val client: GattClient) : BleProfile {
@@ -184,12 +377,16 @@ private class SimLinkProfile(private val client: GattClient) : BleProfile {
 
     private fun command(json: JSONObject, allowChannelRecovery: Boolean = false): JSONObject {
         val bytes = json.toString().toByteArray(Charsets.UTF_8)
-        val response = client.exchange(tx, bytes) { current ->
-            try {
-                JSONObject(current.toString(Charsets.UTF_8))
-                current.size
-            } catch (_: Exception) { null }
-        }
+        val response = client.exchange(
+                tx,
+                bytes,
+                expectedLength = { current ->
+                    try {
+                        JSONObject(current.toString(Charsets.UTF_8))
+                        current.size
+                    } catch (_: Exception) { null }
+                }
+        )
         val result = JSONObject(response.toString(Charsets.UTF_8))
         if (result.has("error")) {
             val errorMessage = result.get("error").toString()

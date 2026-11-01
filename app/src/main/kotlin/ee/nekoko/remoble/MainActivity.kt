@@ -442,7 +442,11 @@ class MainActivity : AppCompatActivity() {
             val row = readerWhitelistContainer.getChildAt(i) as? android.widget.LinearLayout
             val cb = row?.getChildAt(0) as? CheckBox
             if (cb != null && cb.isChecked) {
-                allowed.add(cb.text.toString())
+                val readerID = cb.text.toString()
+                val address = readerID.substringAfterLast('|', missingDelimiterValue = "")
+                // Persist the selection by MAC, not by the mutable advertised
+                // device name. The legacy full name remains readable.
+                allowed.add(if (address.isEmpty()) readerID else "ble|${address.uppercase()}")
             }
         }
 
