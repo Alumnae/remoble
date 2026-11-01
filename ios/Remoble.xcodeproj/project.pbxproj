@@ -19,6 +19,7 @@
 		A00000000000000000000010 /* HTTPPasswordStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000012 /* HTTPPasswordStore.swift */; };
 		A00000000000000000000011 /* BLEAdditionalProfiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000013 /* BLEAdditionalProfiles.swift */; };
 		A00000000000000000000012 /* NineEsimCardAuthenticator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* NineEsimCardAuthenticator.swift */; };
+		A00000000000000000000013 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +37,7 @@
 		B00000000000000000000012 /* HTTPPasswordStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPPasswordStore.swift; sourceTree = "<group>"; };
 		B00000000000000000000013 /* BLEAdditionalProfiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEAdditionalProfiles.swift; sourceTree = "<group>"; };
 		B00000000000000000000014 /* NineEsimCardAuthenticator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NineEsimCardAuthenticator.swift; sourceTree = "<group>"; };
+		B00000000000000000000015 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -71,6 +73,7 @@
 				B00000000000000000000012 /* HTTPPasswordStore.swift */,
 				B00000000000000000000013 /* BLEAdditionalProfiles.swift */,
 				B00000000000000000000014 /* NineEsimCardAuthenticator.swift */,
+				B00000000000000000000015 /* Assets.xcassets */,
 				B00000000000000000000006 /* RemoHTTPServer.swift */,
 				B00000000000000000000007 /* Info.plist */,
 			);
@@ -143,6 +146,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A00000000000000000000013 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -196,6 +200,7 @@
 		E10000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 38;
 				DEVELOPMENT_TEAM = V7ZP3EHBL7;
@@ -214,6 +219,7 @@
 		E10000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 38;
 				DEVELOPMENT_TEAM = V7ZP3EHBL7;
