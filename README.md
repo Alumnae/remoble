@@ -59,10 +59,9 @@ an always-running iOS service.
 
 1. Install Remoble on the Android phone that is physically near the BLE reader.
 2. Grant Nearby devices permission and turn on Bluetooth.
-3. For an NBLE/9eSIM reader, enter its six-character hexadecimal PIN in **BLE eUICC PIN**. If
-   the factory PIN is unchanged, leave the field empty: Remoble derives the default from the
-   device name using the same rule as NekokoLPA2 (the last six characters in reverse order).
-4. Start the server and wait for the BLE reader to appear in **Allowed readers**.
+3. In **Bluetooth cards**, tap a card name to connect with its saved or automatic credential.
+   Use **Connect with PIN** only when that card has a custom six-character hexadecimal PIN.
+4. Check the card to remember it and expose it to remote clients. Swipe it left to forget it.
 5. Note the actual listening port shown by Remoble. It may be `33778` when RemoCard already uses
    `33777`.
 6. In NekokoLPA2 add a Remote / RemoCard endpoint:
@@ -72,17 +71,25 @@ an always-running iOS service.
 
 After the first successful GATT connection, Remoble stores the reader address, display name and
 protocol type. On later launches the foreground service tries that reader again even before a new
-advertisement is received. The NBLE PIN is stored only in the app's private preferences and reused
-for its challenge-response authentication. This protocol-level PIN is separate from Android's
-optional operating-system BLE bonding prompt.
+advertisement is received. Each reader has an independent PIN entry keyed by Bluetooth MAC
+address. A new value replaces the saved value only after successful authentication; a rejected
+PIN clears that reader's cached credential. The HTTP password and downloaded card-authorization
+keys use Android Keystore-backed AES-GCM storage on Android 6.0 and newer.
 
 If every AID supplied to `/openChannel` fails, Remoble treats the connection as potentially stale:
 it closes the current GATT/profile state, reconnects and authenticates the remembered BLE reader,
 then retries the complete AID list once. A second failure is returned normally, so an unsupported
 AID cannot cause an infinite reconnect loop.
 
-The HTTP service is unencrypted. Set a connection password and use a trusted LAN/VPN; do not
-expose the displayed listening port directly to the public internet.
+The Android foreground service holds a partial wake lock, so HTTP and BLE remain available with
+the screen off without using the iOS sound-player workaround. New transactions are blocked below
+the configurable RSSI threshold, while an operation already in progress is never interrupted.
+Active transactions are assigned to their client and journaled; a second client cannot interrupt
+a download, while ten attempts can recover a stale channel after its safety delay.
+
+The listener uses plain HTTP. With a connection password, compatible card request and response
+bodies are additionally protected with AES-256-CBC, but a trusted LAN/VPN is still recommended.
+Do not expose the listening port directly to the public internet.
 
 ## Signing
 

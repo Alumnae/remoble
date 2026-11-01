@@ -26,6 +26,17 @@ internal class BleCardSettlingException(val retryAfterMillis: Long) : IllegalSta
         "9eSIM is applying the profile switch; retry in ${retryAfterMillis.coerceAtLeast(0)} ms"
 )
 
+data class BleReaderSnapshot(
+        val readerName: String,
+        val displayName: String,
+        val type: String,
+        val address: String,
+        val rssi: Int?,
+        val remembered: Boolean,
+        val connected: Boolean,
+        val settling: Boolean
+)
+
 /** BLE-central smart-card backend exposed through the existing RemoCard HTTP API. */
 @SuppressLint("MissingPermission")
 class BleSmartcardService(
@@ -90,6 +101,58 @@ class BleSmartcardService(
 
     override val isConnected: Boolean
         get() = !closed && hasPermissions() && adapter?.isEnabled == true
+
+    val isScanning: Boolean
+        get() = scanning
+
+    fun readerSnapshots(): List<BleReaderSnapshot> =
+            readers.mapNotNull { smartcardReader ->
+                val reader = smartcardReader as? BleReader ?: return@mapNotNull null
+                BleReaderSnapshot(
+                        readerName = reader.name,
+                        displayName = reader.displayName,
+                        type = reader.type,
+                        address = reader.device.address.uppercase(),
+                        rssi = reader.lastRssi,
+                        remembered = reader.remembered,
+                        connected = reader.isProfileConnected(),
+                        settling = reader.isSettling()
+                )
+            }
+
+    fun savedPin(readerName: String): String =
+            findReader(readerName)?.let { reader ->
+                prefs.getString(pinKey(reader), "")
+            }.orEmpty()
+
+    fun connectReader(readerName: String, pin: String? = null): SmartcardSession? {
+        val reader = findReader(readerName) ?: return null
+        reader.throwIfSettling()
+        reader.disconnect()
+        Thread.sleep(350)
+        reader.connectExplicit(pin)
+        return BleSession(reader)
+    }
+
+    fun setReaderEnabled(readerName: String, enabled: Boolean) {
+        val reader = findReader(readerName) ?: return
+        if (enabled) {
+            remember(reader)
+        }
+        executor.execute { onReadersChanged() }
+    }
+
+    fun forgetReader(readerName: String) {
+        val reader = findReader(readerName) ?: return
+        reader.disconnect()
+        reader.remembered = false
+        removeRemembered(reader)
+        prefs.edit().remove(pinKey(reader)).apply()
+        foundReaders.remove(reader.device.address.uppercase(), reader)
+        executor.execute { onReadersChanged() }
+    }
+
+    fun currentRssi(readerName: String): Int? = findReader(readerName)?.lastRssi
 
     fun startScan(): Boolean {
         // On Android 12+, even querying adapter state requires BLUETOOTH_CONNECT.
@@ -161,7 +224,9 @@ class BleSmartcardService(
         val readerName = "ble:$type|$address"
         val existing = foundReaders[address]
         if (existing == null) {
-            foundReaders[address] = BleReader(readerName, displayName, type, result.device)
+            foundReaders[address] = BleReader(
+                    readerName, displayName, type, result.device, lastRssi = result.rssi
+            )
             executor.execute { onReadersChanged() }
         } else if (existing.type != type ||
                 (type == BleProfileFactory.TYPE_TYBLE && existing.displayName != displayName)) {
@@ -169,12 +234,15 @@ class BleSmartcardService(
             // the live eight-digit B1 advertisement before authenticating.
             val wasRemembered = existing.remembered
             existing.disconnect()
-            val replacement = BleReader(readerName, displayName, type, result.device)
+            val replacement = BleReader(
+                    readerName, displayName, type, result.device, lastRssi = result.rssi
+            )
             foundReaders[address] = replacement
             if (wasRemembered) remember(replacement)
             executor.execute { onReadersChanged() }
         } else {
             existing.lastSeen = System.currentTimeMillis()
+            existing.lastRssi = result.rssi
         }
     }
 
@@ -211,7 +279,6 @@ class BleSmartcardService(
     }
 
     private fun remember(reader: BleReader) {
-        if (reader.remembered) return
         reader.remembered = true
         val current = prefs.getStringSet(PREF_REMEMBERED_READERS, emptySet()).orEmpty().toMutableSet()
         current.removeAll { encoded ->
@@ -230,12 +297,27 @@ class BleSmartcardService(
         Log.i(TAG, "Remembered BLE reader ${reader.name}")
     }
 
+    private fun removeRemembered(reader: BleReader) {
+        val current = prefs.getStringSet(PREF_REMEMBERED_READERS, emptySet()).orEmpty().toMutableSet()
+        current.removeAll { encoded ->
+            runCatching {
+                JSONObject(encoded).optString("address")
+                        .equals(reader.device.address, ignoreCase = true)
+            }.getOrDefault(false)
+        }
+        prefs.edit().putStringSet(PREF_REMEMBERED_READERS, current).apply()
+    }
+
+    private fun pinKey(reader: BleReader): String =
+            "nble.pin.${reader.device.address.uppercase().replace(":", "")}"
+
     private inner class BleReader(
             override val name: String,
             val displayName: String,
             val type: String,
             val device: BluetoothDevice,
-            @Volatile var remembered: Boolean = false
+            @Volatile var remembered: Boolean = false,
+            @Volatile var lastRssi: Int? = null
     ) : SmartcardReader {
         @Volatile var lastSeen: Long = System.currentTimeMillis()
         private val lock = Any()
@@ -258,19 +340,39 @@ class BleSmartcardService(
             return BleSession(this)
         }
 
-        private fun connectProfile(): BleProfile {
+        fun isProfileConnected(): Boolean = synchronized(lock) { profile != null }
+
+        fun connectExplicit(pin: String?) = synchronized(lock) {
+            settleNbleIfRequired()
+            profile = connectProfile(pin?.trim()?.uppercase()?.takeIf(NbleAuth::isHexPin))
+        }
+
+        private fun connectProfile(pinOverride: String? = null): BleProfile {
             val client = GattClient(context, device)
-            val configuredPin = prefs.getString(NbleAuth.PREF_KEY, null)
-                    ?.takeIf(NbleAuth::isHexPin)
+            val configuredPin = pinOverride
+                    ?: prefs.getString(pinKey(this), null)?.takeIf(NbleAuth::isHexPin)
             val newProfile = BleProfileFactory.create(type, client, displayName, configuredPin)
             try {
                 newProfile.connect()
                 remember(this)
+                if (pinOverride != null) {
+                    prefs.edit().putString(pinKey(this), pinOverride).apply()
+                }
                 return newProfile
             } catch (error: Throwable) {
                 runCatching { newProfile.close() }
+                if (configuredPin != null && isPinFailure(error)) {
+                    prefs.edit().remove(pinKey(this)).apply()
+                }
                 throw error
             }
+        }
+
+        private fun isPinFailure(error: Throwable): Boolean {
+            val message = generateSequence(error) { it.cause }
+                    .joinToString(" ") { it.message.orEmpty().lowercase() }
+            return listOf("pin", "password", "authenticate", "authentication", "6982", "63c")
+                    .any(message::contains)
         }
 
         fun transceive(command: ByteArray): ByteArray = synchronized(lock) {

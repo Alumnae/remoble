@@ -1,613 +1,705 @@
 package ee.nekoko.remoble
 
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.text.InputFilter
 import android.text.InputType
 import android.text.method.PasswordTransformationMethod
-import android.text.method.DigitsKeyListener
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
-import android.widget.*
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import ee.nekoko.remoble.ble.BleProfileFactory
+import ee.nekoko.remoble.ble.BleReaderSnapshot
 import ee.nekoko.remoble.ble.BleSmartcardService
 import ee.nekoko.remoble.ble.NbleAuth
-import ee.nekoko.remoble.omapi.*
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
+    companion object {
+        private const val PREFS = "remoble_prefs"
+        private const val COLOR_ACCENT = "#7C4DFF"
+        private const val COLOR_CARD = "#202738"
+        private const val COLOR_BACKGROUND = "#090D18"
+    }
+
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var smartcardService: BleSmartcardService? = null
+    private var ownsSmartcardService = false
+    private var pendingServiceStart = false
+    private val passwordStore by lazy { HTTPPasswordStore(this) }
+
+    private lateinit var content: LinearLayout
     private lateinit var statusText: TextView
+    private lateinit var urlText: TextView
     private lateinit var actionButton: Button
     private lateinit var portInput: EditText
     private lateinit var passwordInput: EditText
-    private lateinit var blePinInput: EditText
+    private lateinit var passwordStatus: TextView
+    private lateinit var minimumRssiValue: TextView
+    private lateinit var minimumRssiSlider: SeekBar
     private lateinit var singleChannelCheckbox: CheckBox
     private lateinit var autoStartCheckbox: CheckBox
-    private lateinit var readerWhitelistContainer: LinearLayout
+    private lateinit var readersContainer: LinearLayout
     private lateinit var clientsContainer: LinearLayout
-    private var smartcardService: SmartcardService? = null
-    private var pendingServiceStart = false
 
-    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private val uiRefreshTask =
-            object : Runnable {
-                override fun run() {
-                    refreshClientList()
-                    refreshReaderWhitelist()
-                    if (isServiceRunning) updateUi(true)
-                    uiHandler.postDelayed(this, 5000)
-                }
-            }
-
-    private var isServiceRunning = false
+    private val uiRefreshTask = object : Runnable {
+        override fun run() {
+            adoptServiceBackendIfAvailable()
+            updateServerUi()
+            refreshReaders()
+            refreshClientList()
+            uiHandler.postDelayed(this, 2_000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val prefs = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
-        val root =
-                ScrollView(this).apply {
-                    setBackgroundColor(Color.parseColor("#121212")) // Dark background
-                    isFillViewport = true
-                }
-
-        val layout =
-                LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(64, 48, 64, 64)
-                    gravity = Gravity.CENTER_HORIZONTAL
-                }
-
-        // Add Header/Title
-        val titleText =
-                TextView(this).apply {
-                    text = "Remoble"
-                    textSize = 34f
-                    typeface = android.graphics.Typeface.DEFAULT_BOLD
-                    setTextColor(Color.parseColor("#FF9800")) // Orange
-                    setPadding(0, 32, 0, 8)
-                    gravity = Gravity.CENTER
-                }
-        val subtitleText =
-                TextView(this).apply {
-                    text = "REMOTE BLE eUICC BRIDGE"
-                    textSize = 10f
-                    letterSpacing = 0.2f
-                    setTextColor(Color.parseColor("#FF9800"))
-                    setPadding(0, 0, 0, 48)
-                    gravity = Gravity.CENTER
-                }
-        layout.addView(titleText)
-        layout.addView(subtitleText)
-
-        statusText =
-                TextView(this).apply {
-                    text = "Remoble Server Offline"
-                    textSize = 20f
-                    setTextColor(Color.GRAY)
-                    setPadding(0, 0, 0, 48)
-                    gravity = Gravity.CENTER
-                }
-
-        actionButton =
-                Button(this).apply {
-                    text = "Start Server"
-                    setAllCaps(false)
-                    textSize = 16f
-                    setTextColor(Color.WHITE)
-                    layoutParams =
-                            LinearLayout.LayoutParams(
-                                            LinearLayout.LayoutParams.MATCH_PARENT,
-                                            LinearLayout.LayoutParams.WRAP_CONTENT
-                                    )
-                                    .apply { setMargins(0, 0, 0, 64) }
-                    setOnClickListener {
-                        if (isServiceRunning) {
-                            stopRemoService()
-                            updateUi(false)
-                        } else {
-                            saveSettings()
-                            if (startRemoService()) updateUi(true)
-                        }
-                    }
-                }
-
-        // Settings section
-        val settingsTitle =
-                TextView(this).apply {
-                    text = "SERVER SETTINGS"
-                    textSize = 12f
-                    setTextColor(Color.DKGRAY)
-                    setPadding(0, 32, 0, 16)
-                }
-
-        portInput =
-                createLabeledInput(
-                        "Server Port",
-                        RemoService.DEFAULT_PORT.toString(),
-                        InputType.TYPE_CLASS_NUMBER
-                )
-        portInput.setText(prefs.getInt("port", RemoService.DEFAULT_PORT).toString())
-
-        passwordInput =
-                createLabeledInput(
-                        "Connection Password",
-                        "",
-                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                )
-        passwordInput.setText(prefs.getString("password", ""))
-
-        blePinInput =
-                createLabeledInput(
-                        "BLE eUICC PIN",
-                        "6 hex characters; blank uses device default",
-                        InputType.TYPE_CLASS_TEXT
-                ).apply {
-                    keyListener = DigitsKeyListener.getInstance("0123456789abcdefABCDEF")
-                    filters = arrayOf(android.text.InputFilter.LengthFilter(6))
-                    transformationMethod = PasswordTransformationMethod.getInstance()
-                    setText(prefs.getString(NbleAuth.PREF_KEY, ""))
-                }
-
-        singleChannelCheckbox =
-                createCheckBox(
-                        "Restrict to Single Channel",
-                        prefs.getBoolean("single_channel", true)
-                )
-        singleChannelCheckbox.setOnCheckedChangeListener { _, _ -> saveSettings() }
-
-        autoStartCheckbox =
-                createCheckBox("Auto-start on Boot", prefs.getBoolean("auto_start", true))
-        autoStartCheckbox.setOnCheckedChangeListener { _, _ -> saveSettings() }
-
-        val whitelistTitle =
-                TextView(this).apply {
-                    text = "ALLOWED READERS (Defaults to all if none selected)"
-                    textSize = 12f
-                    setTextColor(Color.DKGRAY)
-                    setPadding(0, 32, 0, 16)
-                }
-        readerWhitelistContainer =
-                LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(0, 0, 0, 32)
-                }
-
-        val clientsTitle =
-                TextView(this).apply {
-                    text = "CONNECTED CLIENTS (Last 10m)"
-                    textSize = 12f
-                    setTextColor(Color.parseColor("#FF9800"))
-                    setPadding(0, 32, 0, 16)
-                }
-        clientsContainer =
-                LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(0, 0, 0, 32)
-                }
-
-        layout.addView(statusText)
-        layout.addView(actionButton)
-        layout.addView(settingsTitle)
-        layout.addView(createLabel("Port"))
-        layout.addView(portInput)
-        layout.addView(createLabel("Password (Leave empty for none)"))
-        layout.addView(passwordInput)
-        layout.addView(createLabel("BLE eUICC PIN (6 hexadecimal characters)"))
-        layout.addView(blePinInput)
-        layout.addView(singleChannelCheckbox)
-        layout.addView(autoStartCheckbox)
-        layout.addView(whitelistTitle)
-        layout.addView(readerWhitelistContainer)
-        layout.addView(clientsTitle)
-        layout.addView(clientsContainer)
-
-        // Init SE Service to list readers
-        smartcardService =
-                BleSmartcardService(this, java.util.concurrent.Executors.newSingleThreadExecutor()) {
-                            runOnUiThread { refreshReaderWhitelist() }
-                        }
-
-        // Add text change listeners for auto-save
-        val textWatcher =
-                object : android.text.TextWatcher {
-                    override fun afterTextChanged(s: android.text.Editable?) {
-                        saveSettings()
-                    }
-                    override fun beforeTextChanged(
-                            s: CharSequence?,
-                            start: Int,
-                            count: Int,
-                            after: Int
-                    ) {}
-                    override fun onTextChanged(
-                            s: CharSequence?,
-                            start: Int,
-                            before: Int,
-                            count: Int
-                    ) {}
-                }
-        portInput.addTextChangedListener(textWatcher)
-        passwordInput.addTextChangedListener(textWatcher)
-        blePinInput.addTextChangedListener(
-                object : android.text.TextWatcher {
-                    override fun afterTextChanged(value: android.text.Editable?) {
-                        val pin = value?.toString().orEmpty()
-                        blePinInput.error =
-                                if (pin.isEmpty() || NbleAuth.isHexPin(pin)) null
-                                else "PIN must contain exactly 6 hexadecimal characters"
-                        saveSettings()
-                    }
-
-                    override fun beforeTextChanged(
-                            value: CharSequence?,
-                            start: Int,
-                            count: Int,
-                            after: Int
-                    ) {}
-
-                    override fun onTextChanged(
-                            value: CharSequence?,
-                            start: Int,
-                            before: Int,
-                            count: Int
-                    ) {}
-                }
-        )
-
-        root.addView(layout)
-        setContentView(root)
+        buildInterface()
         requestBlePermissions(startServiceWhenGranted = false)
-
-        // Start UI refresh task
+        ensureScanner()
         uiHandler.post(uiRefreshTask)
 
-        // Auto-start on launch if enabled
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.getBoolean("auto_start", true)) {
             pendingServiceStart = true
-            if (startRemoService()) updateUi(true)
+            startRemoService()
         }
     }
 
-    private fun createLabel(text: String) =
-            TextView(this).apply {
-                this.text = text
-                textSize = 14f
-                setTextColor(Color.LTGRAY)
-                setPadding(0, 16, 0, 8)
-            }
+    private fun buildInterface() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val root = ScrollView(this).apply {
+            isFillViewport = true
+            background = GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    intArrayOf(Color.parseColor("#171C33"), Color.parseColor(COLOR_BACKGROUND))
+            )
+        }
+        content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(48))
+        }
+        root.addView(content)
 
-    private fun createLabeledInput(label: String, hint: String, inputType: Int): EditText {
-        return EditText(this).apply {
-            this.hint = hint
-            this.inputType = inputType
+        content.addView(TextView(this).apply {
+            text = "REMOBLE"
+            textSize = 12f
+            letterSpacing = 0.24f
+            setTextColor(Color.parseColor("#B9A7FF"))
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        content.addView(TextView(this).apply {
+            text = "Bluetooth Bridge"
+            textSize = 32f
             setTextColor(Color.WHITE)
-            setHintTextColor(Color.DKGRAY)
-            background.setColorFilter(Color.GRAY, android.graphics.PorterDuff.Mode.SRC_ATOP)
-        }
-    }
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(4), 0, dp(22))
+        })
 
-    private fun createCheckBox(text: String, checked: Boolean) =
-            CheckBox(this).apply {
-                this.text = text
-                this.isChecked = checked
-                setTextColor(Color.LTGRAY)
-                setPadding(0, 24, 0, 24)
-                // Set checkbox tint to orange
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    buttonTintList =
-                            android.content.res.ColorStateList.valueOf(Color.parseColor("#FF9800"))
+        val statusCard = card().apply {
+            statusText = valueText("Starting…", 19f)
+            urlText = valueText("", 13f).apply { setTextColor(Color.parseColor("#AAB4C8")) }
+            addView(statusText)
+            addView(urlText)
+            actionButton = primaryButton("Start bridge") {
+                if (RemoService.isRunning) stopRemoService() else {
+                    saveGeneralSettings()
+                    startRemoService()
                 }
             }
+            addView(actionButton, matchParams(top = 18))
+        }
+        content.addView(statusCard)
+
+        sectionTitle("Remote bridge")
+        val bridgeCard = card()
+        val portRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label("Port"), LinearLayout.LayoutParams(0, dp(48), 1f))
+            portInput = EditText(this@MainActivity).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                setText(prefs.getInt("port", RemoService.DEFAULT_PORT).toString())
+                setTextColor(Color.WHITE)
+                gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                setBackgroundColor(Color.TRANSPARENT)
+                filters = arrayOf(InputFilter.LengthFilter(5))
+                textSize = 16f
+            }
+            addView(portInput, LinearLayout.LayoutParams(dp(110), dp(48)))
+        }
+        bridgeCard.addView(portRow)
+        bridgeCard.addView(caption("1024–65535. Applying a new port restarts the listener."))
+        bridgeCard.addView(primaryButton("Apply port") { applyPort() }, matchParams(top = 12))
+        content.addView(bridgeCard)
+
+        sectionTitle("Remote security")
+        val securityCard = card()
+        passwordStatus = valueText("", 15f)
+        securityCard.addView(passwordStatus)
+        passwordInput = EditText(this).apply {
+            hint = "Remote password"
+            setHintTextColor(Color.parseColor("#778198"))
+            setTextColor(Color.WHITE)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            transformationMethod = PasswordTransformationMethod.getInstance()
+            background = rounded("#151B29", 12)
+            setPadding(dp(14), 0, dp(14), 0)
+        }
+        securityCard.addView(passwordInput, matchParams(height = 52, top = 14))
+        val passwordButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(primaryButton("Update") { updatePassword(false) }, LinearLayout.LayoutParams(0, dp(48), 1f))
+            addView(space(dp(10)))
+            addView(secondaryButton("Remove") { updatePassword(true) }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        }
+        securityCard.addView(passwordButtons, matchParams(top = 12))
+        securityCard.addView(caption("Use the same password in the remote client. Card requests remain AES-256-CBC compatible."), matchParams(top = 10))
+        content.addView(securityCard)
+
+        sectionTitle("Bluetooth signal safety")
+        val signalCard = card()
+        val signalTitle = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(label("Minimum RSSI"), LinearLayout.LayoutParams(0, dp(42), 1f))
+            minimumRssiValue = valueText("", 15f).apply { gravity = Gravity.END or Gravity.CENTER_VERTICAL }
+            addView(minimumRssiValue, LinearLayout.LayoutParams(dp(100), dp(42)))
+        }
+        signalCard.addView(signalTitle)
+        minimumRssiSlider = SeekBar(this).apply {
+            max = 70
+            progress = prefs.getInt("minimum_rssi", -88).coerceIn(-120, -50) + 120
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val value = progress - 120
+                    minimumRssiValue.text = "$value dBm"
+                    if (fromUser) {
+                        prefs.edit().putInt("minimum_rssi", value).apply()
+                        notifyServiceSettingsChanged()
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        minimumRssiValue.text = "${minimumRssiSlider.progress - 120} dBm"
+        signalCard.addView(minimumRssiSlider)
+        signalCard.addView(caption("A new secure transaction is refused below this threshold. Active operations are never interrupted."))
+        content.addView(signalCard)
+
+        sectionTitle("Operation")
+        val operationCard = card()
+        singleChannelCheckbox = checkbox(
+                "Restrict to a single logical channel",
+                prefs.getBoolean("single_channel", true)
+        ) { saveGeneralSettings() }
+        autoStartCheckbox = checkbox(
+                "Start bridge when the phone boots",
+                prefs.getBoolean("auto_start", true)
+        ) { saveGeneralSettings() }
+        operationCard.addView(singleChannelCheckbox)
+        operationCard.addView(autoStartCheckbox)
+        operationCard.addView(caption("The foreground service and partial wake lock keep HTTP and Bluetooth available while the screen is off."))
+        content.addView(operationCard)
+
+        sectionTitle("Bluetooth cards")
+        val readerCard = card()
+        readerCard.addView(primaryButton("Scan for cards") {
+            ensureScanner()
+            val started = smartcardService?.startScan() == true
+            Toast.makeText(this, if (started) "Scanning" else "Scan already active", Toast.LENGTH_SHORT).show()
+        })
+        readersContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, 0)
+        }
+        readerCard.addView(readersContainer)
+        readerCard.addView(caption("Tap a card name to connect. Check it to remember and expose it remotely. Swipe a card left to forget it."))
+        content.addView(readerCard)
+
+        sectionTitle("Diagnostics")
+        val diagnostics = card()
+        clientsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        diagnostics.addView(clientsContainer)
+        diagnostics.addView(caption("Compatible clients seen during the last ten minutes."), matchParams(top = 8))
+        content.addView(diagnostics)
+
+        sectionTitle("About")
+        content.addView(card().apply {
+            addView(valueText("Remoble 0.3.8-beta", 16f))
+            addView(caption("Android 5.0+ · Bluetooth Low Energy · foreground background operation"))
+        })
+
+        setContentView(root)
+        updatePasswordStatus()
+    }
+
+    private fun updateServerUi() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val running = RemoService.isRunning
+        val port = RemoService.listeningPort.takeIf { it > 0 }
+                ?: prefs.getInt("port", RemoService.DEFAULT_PORT)
+        val addresses = ipAddresses()
+        statusText.text = if (running) "Bridge online" else "Bridge offline"
+        statusText.setTextColor(Color.parseColor(if (running) "#62D98B" else "#AAB4C8"))
+        urlText.text = if (running) {
+            val address = addresses.firstOrNull() ?: "0.0.0.0"
+            "http://$address:$port${RemoService.serverStatusMessage?.let { "\n$it" }.orEmpty()}"
+        } else "Start the bridge to accept remote connections"
+        actionButton.text = if (running) "Stop bridge" else "Start bridge"
+        updatePasswordStatus()
+    }
+
+    private fun refreshReaders() {
+        if (!::readersContainer.isInitialized) return
+        val backend = smartcardService ?: return
+        val snapshots = backend.readerSnapshots()
+        readersContainer.removeAllViews()
+        if (snapshots.isEmpty()) {
+            readersContainer.addView(caption("No compatible Bluetooth card found"))
+            return
+        }
+        snapshots.forEachIndexed { index, reader ->
+            if (index > 0) readersContainer.addView(divider())
+            readersContainer.addView(readerView(reader))
+        }
+    }
+
+    private fun readerView(reader: BleReaderSnapshot): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val enabled = checkbox("", isReaderVisible(reader)) { checked ->
+            smartcardService?.setReaderEnabled(reader.readerName, checked)
+            updateAllowedReader(reader, checked)
+        }.apply { setPadding(0, 0, 0, 0) }
+        top.addView(enabled, LinearLayout.LayoutParams(dp(48), dp(48)))
+        val identity = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            addView(valueText(reader.displayName, 16f).apply { typeface = Typeface.DEFAULT_BOLD })
+            addView(caption("${reader.type.uppercase()} · ${reader.address}"))
+            setOnClickListener { connectReader(reader, null) }
+        }
+        top.addView(identity, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val state = when {
+            reader.connected -> "Connected"
+            reader.settling -> "Recovering"
+            else -> "Ready"
+        }
+        top.addView(valueText(state, 13f).apply {
+            gravity = Gravity.END
+            setTextColor(Color.parseColor(if (reader.connected) "#62D98B" else if (reader.settling) "#FFB74D" else "#AAB4C8"))
+        })
+        row.addView(top)
+
+        val detail = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val rssi = reader.rssi
+        detail.addView(caption(if (rssi == null) "Signal unavailable" else "$rssi dBm · ${signalQuality(rssi)}"), LinearLayout.LayoutParams(0, dp(42), 1f))
+        if (reader.type == BleProfileFactory.TYPE_NBLE) {
+            val hasPin = smartcardService?.savedPin(reader.readerName).orEmpty().isNotEmpty()
+            detail.addView(secondaryButton(if (hasPin) "Reconnect with PIN" else "Connect with PIN") {
+                showPinDialog(reader)
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(42)))
+        }
+        row.addView(detail)
+
+        var downX = 0f
+        row.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    false
+                }
+                MotionEvent.ACTION_UP -> if (event.rawX - downX < -dp(90)) {
+                    smartcardService?.forgetReader(reader.readerName)
+                    removeAllowedReader(reader)
+                    Toast.makeText(this, "Card forgotten", Toast.LENGTH_SHORT).show()
+                    refreshReaders()
+                    true
+                } else false
+                else -> false
+            }
+        }
+        return row
+    }
+
+    private fun connectReader(reader: BleReaderSnapshot, pin: String?) {
+        smartcardService?.setReaderEnabled(reader.readerName, true)
+        updateAllowedReader(reader, true)
+        Toast.makeText(this, "Connecting to ${reader.displayName}", Toast.LENGTH_SHORT).show()
+        worker.execute {
+            val result = runCatching { smartcardService?.connectReader(reader.readerName, pin) }
+            runOnUiThread {
+                if (result.isSuccess && result.getOrNull() != null) {
+                    Toast.makeText(this, "Connected", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, result.exceptionOrNull()?.message ?: "Connection failed", Toast.LENGTH_LONG).show()
+                }
+                refreshReaders()
+            }
+        }
+    }
+
+    private fun showPinDialog(reader: BleReaderSnapshot) {
+        val input = EditText(this).apply {
+            hint = "6 hexadecimal digits"
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            transformationMethod = PasswordTransformationMethod.getInstance()
+            filters = arrayOf(InputFilter { source, _, _, _, _, _ ->
+                source.toString().uppercase().filter { it in "0123456789ABCDEF" }
+            }, InputFilter.LengthFilter(6))
+        }
+        val dialog = AlertDialog.Builder(this)
+                .setTitle("Connect with PIN")
+                .setMessage("The saved PIN is replaced only after successful authentication.")
+                .setView(input)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Connect", null)
+                .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val pin = input.text.toString().uppercase()
+                if (!NbleAuth.isHexPin(pin)) {
+                    input.error = "Enter exactly 6 hexadecimal characters"
+                } else {
+                    dialog.dismiss()
+                    connectReader(reader, pin)
+                }
+            }
+        }
+        dialog.show()
+    }
 
     private fun refreshClientList() {
         if (!::clientsContainer.isInitialized) return
         clientsContainer.removeAllViews()
         RemoService.cleanOldClients()
-        val clients = RemoService.activeClients
-        val now = System.currentTimeMillis()
-
+        val clients = RemoService.activeClients.toSortedMap()
         if (clients.isEmpty()) {
-            clientsContainer.addView(
-                    TextView(this).apply {
-                        text = "No active clients"
-                        textSize = 13f
-                        setTextColor(Color.DKGRAY)
-                        gravity = Gravity.CENTER
-                    }
-            )
+            clientsContainer.addView(caption("No active clients"))
             return
         }
-
-        clients.forEach { (ip, timestamp) ->
-            val secondsAgo = (now - timestamp) / 1000
-            val row =
-                    LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        setPadding(0, 16, 0, 16)
-                    }
-            val ipText =
-                    TextView(this).apply {
-                        text = ip
-                        weight = 1f
-                        setTextColor(Color.WHITE)
-                        textSize = 14f
-                    }
-            val timeText =
-                    TextView(this).apply {
-                        text = "${secondsAgo}s ago"
-                        setTextColor(
-                                if (secondsAgo < 30) Color.parseColor("#4CAF50") else Color.GRAY
-                        )
-                        textSize = 12f
-                    }
-            row.addView(ipText)
-            row.addView(timeText)
+        val now = System.currentTimeMillis()
+        clients.forEach { (client, timestamp) ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(valueText(client, 14f), LinearLayout.LayoutParams(0, dp(38), 1f))
+            row.addView(caption("${(now - timestamp) / 1000}s ago"), LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)))
             clientsContainer.addView(row)
         }
     }
 
-    private fun LinearLayout.addView(view: View, weight: Float) {
-        val params = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight)
-        view.layoutParams = params
-        this.addView(view)
+    private fun applyPort() {
+        val value = portInput.text.toString().toIntOrNull()
+        if (value == null || value !in 1024..65535) {
+            portInput.error = "Use a port between 1024 and 65535"
+            return
+        }
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt("port", value).apply()
+        restartServiceIfRunning()
     }
 
-    private var TextView.weight: Float
-        get() = 0f
-        set(value) {
-            layoutParams =
-                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, value)
+    private fun updatePassword(remove: Boolean) {
+        val value = if (remove) "" else passwordInput.text.toString().trim()
+        if (!remove && value.isEmpty()) {
+            passwordInput.error = "Enter a password"
+            return
         }
-
-    private fun refreshReaderWhitelist() {
-        readerWhitelistContainer.removeAllViews()
-        val readers = smartcardService?.readers ?: emptyArray<SmartcardReader>()
-        val prefs = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
-        // If "allowed_readers" is missing (null), it means "Allow All"
-        val allowedSet = prefs.getStringSet("allowed_readers", null)
-
-        readers.forEach { reader ->
-            val row =
-                    LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                    }
-
-            // Defaults to checked if no preference exists
-            val readerAddress = reader.name.substringAfterLast('|', missingDelimiterValue = "")
-            val isAllowed =
-                    allowedSet == null ||
-                            allowedSet.contains(reader.name) ||
-                            (readerAddress.isNotEmpty() &&
-                                    allowedSet.any {
-                                        it.substringAfterLast('|', missingDelimiterValue = "") ==
-                                                readerAddress
-                                    })
-
-            val cb = createCheckBox(reader.name, isAllowed)
-            cb.setOnCheckedChangeListener { _, isChecked -> saveSettings() }
-            cb.setPadding(0, 0, 0, 0)
-
-            val eid = RemoService.slotEids[reader.name]
-            val aid = RemoService.slotAids[reader.name]
-            val error = RemoService.slotErrors[reader.name]
-
-            val statusText =
-                    if (!eid.isNullOrEmpty()) {
-                        " EID: $eid"
-                    } else if (!aid.isNullOrEmpty()) {
-                        " Channel Open"
-                    } else if (!error.isNullOrEmpty()) {
-                        " $error"
-                    } else {
-                        if (isAllowed) " Connecting / No Card" else " Disabled"
-                    }
-
-            val infoText =
-                    TextView(this).apply {
-                        layoutParams =
-                                android.widget.LinearLayout.LayoutParams(
-                                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
-                                )
-                        text = statusText
-                        textSize = 12f
-                        setTextColor(
-                                if (!error.isNullOrEmpty() ||
-                                                statusText.contains("Error") ||
-                                                statusText.contains("Failed") ||
-                                                statusText.contains("Denied")
-                                )
-                                        Color.RED
-                                else Color.LTGRAY
-                        )
-                        setPadding(16, 0, 0, 0)
-                    }
-
-            row.addView(cb)
-            row.addView(infoText)
-            readerWhitelistContainer.addView(row)
-        }
+        passwordStore.save(value)
+        passwordInput.setText("")
+        notifyServiceSettingsChanged()
+        updatePasswordStatus()
     }
 
-    private fun saveSettings() {
-        val prefs = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
-        val allowed = mutableSetOf<String>()
-        for (i in 0 until readerWhitelistContainer.childCount) {
-            val row = readerWhitelistContainer.getChildAt(i) as? android.widget.LinearLayout
-            val cb = row?.getChildAt(0) as? CheckBox
-            if (cb != null && cb.isChecked) {
-                val readerID = cb.text.toString()
-                val address = readerID.substringAfterLast('|', missingDelimiterValue = "")
-                // Persist the selection by MAC, not by the mutable advertised
-                // device name. The legacy full name remains readable.
-                allowed.add(if (address.isEmpty()) readerID else "ble|${address.uppercase()}")
-            }
-        }
-
-        prefs.edit().apply {
-            putInt(
-                    "port",
-                    portInput.text.toString().toIntOrNull() ?: RemoService.DEFAULT_PORT
-            )
-            putString("password", passwordInput.text.toString())
-            val blePin = blePinInput.text.toString().trim()
-            if (blePin.isEmpty()) remove(NbleAuth.PREF_KEY)
-            else if (NbleAuth.isHexPin(blePin)) putString(NbleAuth.PREF_KEY, blePin.uppercase())
-            if (readerWhitelistContainer.childCount == 0) remove("allowed_readers")
-            else putStringSet("allowed_readers", allowed)
-            putBoolean("single_channel", singleChannelCheckbox.isChecked)
-            putBoolean("auto_start", autoStartCheckbox.isChecked)
-            apply()
-        }
+    private fun updatePasswordStatus() {
+        if (!::passwordStatus.isInitialized) return
+        val configured = passwordStore.load().isNotEmpty()
+        passwordStatus.text = if (configured) "● Password protected" else "● No password configured"
+        passwordStatus.setTextColor(Color.parseColor(if (configured) "#62D98B" else "#FFB74D"))
     }
 
-    private fun getIPAddresses(): List<String> {
-        val ips = mutableListOf<String>()
-        try {
-            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            for (intf in interfaces) {
-                val addrs = Collections.list(intf.inetAddresses)
-                for (addr in addrs) {
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                        addr.hostAddress?.let { ips.add(it) }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return ips
+    private fun saveGeneralSettings() {
+        if (!::singleChannelCheckbox.isInitialized) return
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean("single_channel", singleChannelCheckbox.isChecked)
+                .putBoolean("auto_start", autoStartCheckbox.isChecked)
+                .apply()
+        notifyServiceSettingsChanged()
     }
 
-    private fun updateUi(running: Boolean) {
-        isServiceRunning = running
-        val prefs = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
-        val configuredPort = prefs.getInt("port", RemoService.DEFAULT_PORT)
-        val port = RemoService.listeningPort.takeIf { it > 0 } ?: configuredPort
-        if (running) {
-            if (!portInput.hasFocus() && portInput.text.toString() != port.toString()) {
-                portInput.setText(port.toString())
-            }
-            val ips = getIPAddresses()
-            val ipText = if (ips.isEmpty()) "Unknown IP" else ips.joinToString(", ")
-            val serverNotice = RemoService.serverStatusMessage
-            statusText.text =
-                    if (serverNotice.isNullOrEmpty()) {
-                        "Server running on\n$ipText:$port"
-                    } else {
-                        "Server running on\n$ipText:$port\n$serverNotice"
-                    }
-            statusText.setTextColor(Color.parseColor("#4CAF50"))
-            actionButton.text = "Stop Server"
-            actionButton.setBackgroundColor(Color.parseColor("#E53935"))
+    private fun updateAllowedReader(reader: BleReaderSnapshot, enabled: Boolean) {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val values = if (prefs.contains("allowed_readers")) {
+            prefs.getStringSet("allowed_readers", emptySet()).orEmpty().toMutableSet()
         } else {
-            statusText.text = "Server Offline"
-            statusText.setTextColor(Color.GRAY)
-            actionButton.text = "Start Server"
-            actionButton.setBackgroundColor(Color.parseColor("#1E88E5"))
+            smartcardService?.readerSnapshots().orEmpty()
+                    .filter { it.remembered }
+                    .mapTo(mutableSetOf()) { "ble|${it.address.uppercase()}" }
         }
+        val key = "ble|${reader.address.uppercase()}"
+        values.removeAll { it.substringAfterLast('|').equals(reader.address, ignoreCase = true) }
+        if (enabled) values += key
+        prefs.edit().putStringSet("allowed_readers", values).apply()
+        notifyServiceSettingsChanged()
+    }
+
+    private fun isReaderVisible(reader: BleReaderSnapshot): Boolean {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.contains("allowed_readers")) return true
+        return prefs.getStringSet("allowed_readers", emptySet()).orEmpty().any {
+            it.substringAfterLast('|').equals(reader.address, ignoreCase = true)
+        }
+    }
+
+    private fun removeAllowedReader(reader: BleReaderSnapshot) = updateAllowedReader(reader, false)
+
+    private fun notifyServiceSettingsChanged() {
+        if (RemoService.isRunning) {
+            startService(Intent(this, RemoService::class.java).setAction(RemoService.ACTION_RELOAD_SETTINGS))
+        }
+    }
+
+    private fun restartServiceIfRunning() {
+        if (!RemoService.isRunning) return
+        stopRemoService()
+        uiHandler.postDelayed({ startRemoService() }, 500)
     }
 
     private fun startRemoService(): Boolean {
         if (!hasBlePermissions()) {
             pendingServiceStart = true
             requestBlePermissions(startServiceWhenGranted = true)
-            statusText.text = "Bluetooth permission required"
-            statusText.setTextColor(Color.parseColor("#FF9800"))
             return false
         }
-
-        val intent = Intent(this, RemoService::class.java)
-        return try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
+        return runCatching {
+            if (ownsSmartcardService) {
+                smartcardService?.shutdown()
+                smartcardService = null
+                ownsSmartcardService = false
             }
+            val intent = Intent(this, RemoService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+            else startService(intent)
             pendingServiceStart = false
             true
-        } catch (error: SecurityException) {
-            pendingServiceStart = true
-            statusText.text = "Bluetooth permission denied"
-            statusText.setTextColor(Color.RED)
+        }.getOrElse {
+            ensureScanner()
+            Toast.makeText(this, it.message ?: "Unable to start bridge", Toast.LENGTH_LONG).show()
             false
         }
     }
 
     private fun stopRemoService() {
-        val intent = Intent(this, RemoService::class.java)
-        stopService(intent)
+        stopService(Intent(this, RemoService::class.java))
+        uiHandler.postDelayed({
+            smartcardService = null
+            ensureScanner()
+            updateServerUi()
+        }, 400)
+    }
+
+    private fun adoptServiceBackendIfAvailable() {
+        val serviceBackend = RemoService.bleService
+        if (serviceBackend != null && smartcardService !== serviceBackend) {
+            if (ownsSmartcardService) smartcardService?.shutdown()
+            smartcardService = serviceBackend
+            ownsSmartcardService = false
+        } else if (serviceBackend == null && smartcardService == null) {
+            ensureScanner()
+        }
+    }
+
+    private fun ensureScanner() {
+        if (smartcardService != null || !hasBlePermissions()) return
+        smartcardService = BleSmartcardService(this, worker) { runOnUiThread { refreshReaders() } }
+        ownsSmartcardService = true
     }
 
     private fun hasBlePermissions(): Boolean {
-        val permissions =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    arrayOf(
-                            android.Manifest.permission.BLUETOOTH_SCAN,
-                            android.Manifest.permission.BLUETOOTH_CONNECT
-                    )
-                } else {
-                    arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                }
-        return permissions.all {
-            androidx.core.content.ContextCompat.checkSelfPermission(this, it) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
+        } else arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        return permissions.all { ContextCompat.checkSelfPermission(this, it) == android.content.pm.PackageManager.PERMISSION_GRANTED }
     }
 
     private fun requestBlePermissions(startServiceWhenGranted: Boolean) {
         if (hasBlePermissions()) {
-            if (startServiceWhenGranted && pendingServiceStart && startRemoService()) updateUi(true)
+            ensureScanner()
+            if (startServiceWhenGranted && pendingServiceStart) startRemoService()
             return
         }
-
         pendingServiceStart = pendingServiceStart || startServiceWhenGranted
-        val permissions =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    arrayOf(
-                            android.Manifest.permission.BLUETOOTH_SCAN,
-                            android.Manifest.permission.BLUETOOTH_CONNECT
-                    )
-                } else {
-                    arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                }
-        val missing = permissions.filter {
-            androidx.core.content.ContextCompat.checkSelfPermission(this, it) !=
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-        if (missing.isNotEmpty()) {
-            androidx.core.app.ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1001)
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
+        } else arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        androidx.core.app.ActivityCompat.requestPermissions(this, permissions, 1001)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 1001) return
+        if (hasBlePermissions()) {
+            ensureScanner()
+            if (pendingServiceStart) startRemoService()
+        } else {
+            pendingServiceStart = false
+            Toast.makeText(this, "Nearby devices permission is required", Toast.LENGTH_LONG).show()
         }
     }
 
-    override fun onRequestPermissionsResult(
-            requestCode: Int,
-            permissions: Array<out String>,
-            grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != 1001) return
-
-        if (hasBlePermissions()) {
-            (smartcardService as? BleSmartcardService)?.startScan()
-            if (pendingServiceStart && startRemoService()) updateUi(true)
-        } else {
-            pendingServiceStart = false
-            updateUi(false)
-            statusText.text = "Nearby devices permission denied"
-            statusText.setTextColor(Color.RED)
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            val focused = currentFocus
+            if (focused is EditText) {
+                val bounds = Rect()
+                focused.getGlobalVisibleRect(bounds)
+                if (!bounds.contains(event.rawX.roundToInt(), event.rawY.roundToInt())) {
+                    focused.clearFocus()
+                    (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                            .hideSoftInputFromWindow(focused.windowToken, 0)
+                }
+            }
         }
+        return super.dispatchTouchEvent(event)
     }
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(uiRefreshTask)
-        smartcardService?.shutdown()
+        if (ownsSmartcardService) smartcardService?.shutdown()
+        worker.shutdownNow()
         super.onDestroy()
     }
+
+    private fun ipAddresses(): List<String> = runCatching {
+        Collections.list(NetworkInterface.getNetworkInterfaces())
+                .flatMap { Collections.list(it.inetAddresses) }
+                .filterIsInstance<Inet4Address>()
+                .filterNot { it.isLoopbackAddress }
+                .mapNotNull { it.hostAddress }
+    }.getOrDefault(emptyList())
+
+    private fun signalQuality(rssi: Int): String = when {
+        rssi >= -55 -> "Excellent"
+        rssi >= -67 -> "Good"
+        rssi >= -75 -> "Fair"
+        else -> "Weak"
+    }
+
+    private fun sectionTitle(text: String) {
+        content.addView(TextView(this).apply {
+            this.text = text.uppercase()
+            textSize = 12f
+            letterSpacing = 0.12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#9CA7BD"))
+            setPadding(dp(4), dp(26), 0, dp(10))
+        })
+    }
+
+    private fun card() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(18), dp(18), dp(18), dp(18))
+        background = rounded(COLOR_CARD, 18)
+        elevation = dp(3).toFloat()
+    }
+
+    private fun rounded(color: String, radius: Int) = GradientDrawable().apply {
+        setColor(Color.parseColor(color))
+        cornerRadius = dp(radius).toFloat()
+        setStroke(dp(1), Color.parseColor("#303A50"))
+    }
+
+    private fun label(text: String) = valueText(text, 15f)
+
+    private fun valueText(value: String, size: Float) = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER_VERTICAL
+    }
+
+    private fun caption(value: String) = TextView(this).apply {
+        text = value
+        textSize = 12f
+        setTextColor(Color.parseColor("#98A3B8"))
+        gravity = Gravity.CENTER_VERTICAL
+        setLineSpacing(0f, 1.12f)
+    }
+
+    private fun primaryButton(text: String, action: () -> Unit) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        textSize = 15f
+        setTextColor(Color.WHITE)
+        background = rounded(COLOR_ACCENT, 12)
+        setOnClickListener { action() }
+    }
+
+    private fun secondaryButton(text: String, action: () -> Unit) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        textSize = 13f
+        setTextColor(Color.parseColor("#D6CCFF"))
+        background = rounded("#2A3145", 11)
+        setOnClickListener { action() }
+    }
+
+    private fun checkbox(text: String, checked: Boolean, action: (Boolean) -> Unit) = CheckBox(this).apply {
+        this.text = text
+        isChecked = checked
+        setTextColor(Color.WHITE)
+        buttonTintList = android.content.res.ColorStateList.valueOf(Color.parseColor(COLOR_ACCENT))
+        setPadding(0, dp(6), 0, dp(6))
+        setOnCheckedChangeListener { _, value -> action(value) }
+    }
+
+    private fun divider() = View(this).apply {
+        setBackgroundColor(Color.parseColor("#344057"))
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1))
+    }
+
+    private fun space(width: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(width, 1) }
+
+    private fun matchParams(height: Int = -2, top: Int = 0) =
+            LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    if (height == -2) LinearLayout.LayoutParams.WRAP_CONTENT else dp(height)
+            ).apply { topMargin = dp(top) }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
 }

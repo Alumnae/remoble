@@ -40,7 +40,7 @@ import kotlinx.serialization.json.Json
 
 @Serializable
 data class VersionInfo(
-        val version: String = "2.1-remoble",
+        val version: String = "0.3.8-beta",
         val deviceName: String = android.os.Build.MODEL,
         val supportedCommands: List<String> =
                 listOf(
@@ -49,7 +49,8 @@ data class VersionInfo(
                         "openChannel",
                         "closeChannel",
                         "listSlots",
-                        "listChannels"
+                        "listChannels",
+                        "transactionStatus"
                 ),
         val encryptionRequired: Boolean = false,
         val sessionSupported: Boolean = true
@@ -94,7 +95,10 @@ private val DEFAULT_AIDS =
 data class OpenChannelResponse(
         val success: Boolean,
         val aid: String? = null,
-        val reader: String? = null
+        val reader: String? = null,
+        val state: String? = null,
+        val detail: String? = null,
+        val retryAfterMs: Int? = null
 )
 
 private data class CardAuthorizationState(
@@ -108,6 +112,20 @@ private data class CardAuthorizationState(
 @Serializable data class ListChannelsResponse(val channels: List<String>)
 
 @Serializable
+data class TransactionInfo(
+        val reader: String,
+        val client: String,
+        val state: String,
+        val aid: String? = null,
+        val updatedAt: Long,
+        val rssi: Int? = null,
+        val lastConfirmedAPDU: String? = null,
+        val uncertainAPDU: String? = null
+)
+
+@Serializable data class TransactionStatusResponse(val transactions: List<TransactionInfo>)
+
+@Serializable
 data class SettingsRequest(
         val port: Int? = null,
         val password: String? = null,
@@ -116,19 +134,34 @@ data class SettingsRequest(
 )
 
 class RemoService : Service() {
+    private data class ChannelKey(val client: String, val reader: String, val aid: String)
+    private data class TransactionLease(
+            val client: String,
+            val reader: String,
+            var aid: String?,
+            var state: String = "active",
+            var updatedAt: Long = System.currentTimeMillis(),
+            var rssi: Int? = null,
+            var lastConfirmedAPDU: String? = null,
+            var inFlightAPDU: String? = null
+    )
+
     private var server: ApplicationEngine? = null
     private var smartcardService: SmartcardService? = null
     private val activeSessions = mutableMapOf<String, SmartcardSession>()
-    private val activeChannels = mutableMapOf<String, SmartcardChannel>() // Key: "reader:aid"
+    private val activeChannels = java.util.concurrent.ConcurrentHashMap<ChannelKey, SmartcardChannel>()
     private val cardAuthorizationStates =
-            java.util.concurrent.ConcurrentHashMap<String, CardAuthorizationState>()
+            java.util.concurrent.ConcurrentHashMap<ChannelKey, CardAuthorizationState>()
+    private val transactionLeases = java.util.concurrent.ConcurrentHashMap<String, TransactionLease>()
+    private val takeoverAttempts = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private lateinit var cardPskProvider: NineEsimPskProvider
 
     private var currentPort = 33777
-    private var currentPassword = ""
-    private var currentUseAes = false
-    private var currentSingleChannel = false
-    private var allowedReaders: MutableSet<String>? = null
+    @Volatile private var currentPassword = ""
+    @Volatile private var currentUseAes = false
+    @Volatile private var currentSingleChannel = false
+    @Volatile private var currentMinimumRssi = -88
+    @Volatile private var allowedReaders: MutableSet<String>? = null
     private var customAids = mutableSetOf<String>()
     private val sessionKeys = mutableMapOf<String, ByteArray>() // sessionId -> sessionKey
     private val readerLocks =
@@ -139,8 +172,10 @@ class RemoService : Service() {
         private const val TAG = "RemobleService"
         private const val CHANNEL_ID = "RemobleServer"
         private const val ACTION_SIM_STATE_CHANGED = "android.intent.action.SIM_STATE_CHANGED"
+        const val ACTION_RELOAD_SETTINGS = "ee.nekoko.remoble.RELOAD_SETTINGS"
         const val DEFAULT_PORT = 33777
         private const val PORT_ATTEMPTS = 20
+        private const val TRANSACTION_JOURNAL_KEY = "http.transaction.journals.v1"
         private val json = Json {
             ignoreUnknownKeys = true
             prettyPrint = true
@@ -148,6 +183,12 @@ class RemoService : Service() {
         }
 
         @Volatile var listeningPort: Int = 0
+            private set
+
+        @Volatile var isRunning: Boolean = false
+            private set
+
+        @Volatile var bleService: BleSmartcardService? = null
             private set
 
         @Volatile var serverStatusMessage: String? = null
@@ -186,9 +227,11 @@ class RemoService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         Log.d(TAG, "onCreate")
         cardPskProvider = NineEsimPskProvider(this)
         loadSettings()
+        restoreTransactionLeases()
         selectAvailablePort()
         acquireWakeLock()
         startForegroundService()
@@ -211,9 +254,10 @@ class RemoService : Service() {
     private fun loadSettings() {
         val prefs = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
         currentPort = prefs.getInt("port", DEFAULT_PORT)
-        currentPassword = prefs.getString("password", "") ?: ""
+        currentPassword = HTTPPasswordStore(this).load()
         currentUseAes = currentPassword.isNotEmpty()
         currentSingleChannel = prefs.getBoolean("single_channel", true)
+        currentMinimumRssi = prefs.getInt("minimum_rssi", -88).coerceIn(-120, -50)
         val allowedSet = prefs.getStringSet("allowed_readers", null)
         allowedReaders = if (allowedSet != null) allowedSet.toMutableSet() else null
 
@@ -293,7 +337,8 @@ class RemoService : Service() {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                         packageInfo.signingInfo?.apkContentsSigners ?: emptyArray()
                     } else {
-                        @Suppress("DEPRECATION") packageInfo.signatures ?: emptyArray()
+                        @Suppress("DEPRECATION")
+                        packageInfo.signatures ?: emptyArray()
                     }
 
             for (sig in signatures) {
@@ -349,8 +394,14 @@ class RemoService : Service() {
                             Log.i(TAG, "BLE reader list changed")
                             refreshEids()
                         }
+        bleService = smartcardService as? BleSmartcardService
         // Reconnect persisted readers off the main thread even when they are not advertising.
         bleExecutor.execute { refreshEids() }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RELOAD_SETTINGS) loadSettings()
+        return START_STICKY
     }
 
     private fun refreshEids() {
@@ -360,9 +411,6 @@ class RemoService : Service() {
                 Log.d(TAG, "Skipping EID refresh while ${reader.name} is settling")
                 return@forEach
             }
-            // Clear previous errors if we are retrying
-            val hadError = slotErrors.containsKey(reader.name)
-
             if (reader.isSecureElementPresent) {
                 try {
                     val session = reader.openSession()
@@ -479,11 +527,12 @@ class RemoService : Service() {
                             allowHeader(HttpHeaders.Authorization)
                             allowHeader(HttpHeaders.ContentType)
                             allowHeader(HttpHeaders.AccessControlAllowOrigin)
+                            allowHeader("X-Remoble-Client")
                             anyHost() // Ensure all origins are allowed for web client
                         }
 
                         intercept(ApplicationCallPipeline.Plugins) {
-                            val remoteHost = call.request.origin.remoteHost
+                            val remoteHost = clientID(call)
                             activeClients[remoteHost] = System.currentTimeMillis()
                             cleanOldClients()
 
@@ -536,10 +585,6 @@ class RemoService : Service() {
                                         else readers.filter { isReaderAllowed(it.name) }
                                 val slots =
                                         filtered
-                                                .filter {
-                                                    slotAids[it.name] != null ||
-                                                            slotEids[it.name] != null
-                                                }
                                                 .map {
                                                     SlotInfo(
                                                             it.name,
@@ -552,12 +597,9 @@ class RemoService : Service() {
                             }
 
                             post("/openChannel") {
-                                if (currentSingleChannel) {
-                                    closeAllChannels()
-                                }
-
                                 try {
                                     Log.d(TAG, "POST /openChannel")
+                                    val client = clientID(call)
                                     val req = call.receiveMaybeEncrypted<OpenChannelRequest>()
                                     val readers = smartcardService?.readers ?: emptyArray()
                                     val reader =
@@ -573,6 +615,32 @@ class RemoService : Service() {
                                         return@post
                                     }
 
+                                    if (transactionLeases[reader.name]?.let {
+                                                it.client == client && it.state == "outcome_unknown"
+                                            } == true) {
+                                        call.respondMaybeEncrypted(
+                                                ErrorResponse(
+                                                        "The previous command outcome is unknown. Close the channel and restart the transaction.",
+                                                        "outcome_unknown"
+                                                ),
+                                                HttpStatusCode.Conflict
+                                        )
+                                        return@post
+                                    }
+
+                                    val conflict = leaseConflict(reader.name, client)
+                                    if (conflict != null) {
+                                        call.respondMaybeEncrypted(
+                                                ErrorResponse(conflict.first, conflict.second),
+                                                HttpStatusCode.Conflict
+                                        )
+                                        return@post
+                                    }
+
+                                    if (currentSingleChannel) {
+                                        closeClientChannels(client, reader.name)
+                                    }
+
                                     val allowed = allowedReaders
                                     if (allowed != null && !isReaderAllowed(reader.name)) {
                                         call.respondMaybeEncrypted(
@@ -585,6 +653,20 @@ class RemoService : Service() {
                                         return@post
                                     }
 
+                                    val rssi = (smartcardService as? BleSmartcardService)
+                                            ?.currentRssi(reader.name)
+                                    if (rssi != null && rssi < currentMinimumRssi &&
+                                            activeChannels.keys.none { it.reader == reader.name }) {
+                                        call.respondMaybeEncrypted(
+                                                ErrorResponse(
+                                                        "Bluetooth signal is too weak to start a new transaction (RSSI=$rssi dBm, minimum=$currentMinimumRssi dBm)",
+                                                        "signal_too_weak"
+                                                ),
+                                                HttpStatusCode.Conflict
+                                        )
+                                        return@post
+                                    }
+
                                     val mutex =
                                             readerLocks.getOrPut(reader.name) {
                                                 kotlinx.coroutines.sync.Mutex()
@@ -593,7 +675,14 @@ class RemoService : Service() {
                                     try {
                                         if ((smartcardService as? BleSmartcardService)
                                                         ?.isReaderSettling(reader.name) == true) {
-                                            call.respondMaybeEncrypted(OpenChannelResponse(false))
+                                            call.respondMaybeEncrypted(
+                                                    OpenChannelResponse(
+                                                            success = false,
+                                                            reader = reader.name,
+                                                            state = "reconnecting",
+                                                            retryAfterMs = 1_000
+                                                    )
+                                            )
                                             return@post
                                         }
                                         var openedChannel: SmartcardChannel? = null
@@ -636,7 +725,7 @@ class RemoService : Service() {
                                                             session.openLogicalChannel(aidBytes)
                                                     if (openedChannel != null) {
                                                         matchedAid = aid
-                                                        val channelKey = "${reader.name}:$aid"
+                                                        val channelKey = ChannelKey(client, reader.name, aid)
                                                         activeChannels[channelKey] =
                                                                 openedChannel!!
                                                         cardAuthorizationStates.put(
@@ -670,6 +759,14 @@ class RemoService : Service() {
                                         }
 
                                         if (openedChannel != null) {
+                                            transactionLeases[reader.name] = TransactionLease(
+                                                    client = client,
+                                                    reader = reader.name,
+                                                    aid = matchedAid,
+                                                    rssi = (smartcardService as? BleSmartcardService)
+                                                            ?.currentRssi(reader.name)
+                                            )
+                                            persistTransactionLeases()
                                             call.respondMaybeEncrypted(
                                                     OpenChannelResponse(
                                                             true,
@@ -678,11 +775,29 @@ class RemoService : Service() {
                                                     )
                                             )
                                         } else {
-                                            call.respondMaybeEncrypted(OpenChannelResponse(false))
+                                            call.respondMaybeEncrypted(
+                                                    OpenChannelResponse(
+                                                            success = false,
+                                                            reader = reader.name,
+                                                            state = "aid_rejected",
+                                                            detail = slotErrors[reader.name]
+                                                                    ?: "No provided application identifier was accepted"
+                                                    )
+                                            )
                                         }
                                     } catch (e: BleCardSettlingException) {
                                         closeReaderState(reader.name)
-                                        call.respondMaybeEncrypted(OpenChannelResponse(false))
+                                        call.respondMaybeEncrypted(
+                                                OpenChannelResponse(
+                                                        success = false,
+                                                        reader = reader.name,
+                                                        state = "reconnecting",
+                                                        detail = e.message,
+                                                        retryAfterMs = e.retryAfterMillis
+                                                                .coerceIn(0, Int.MAX_VALUE.toLong())
+                                                                .toInt()
+                                                )
+                                        )
                                     } finally {
                                         mutex.unlock()
                                     }
@@ -705,6 +820,7 @@ class RemoService : Service() {
                             post("/sendApdu") {
                                 try {
                                     Log.d(TAG, "POST /sendApdu")
+                                    val client = clientID(call)
                                     val req = call.receiveMaybeEncrypted<ApduRequest>()
                                     val readers = smartcardService?.readers ?: emptyArray()
                                     val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
@@ -727,8 +843,28 @@ class RemoService : Service() {
                                             }
                                     mutex.lock()
                                     try {
+                                        val conflict = leaseConflict(readerName, client, allowTakeover = false)
+                                        if (conflict != null) {
+                                            call.respondMaybeEncrypted(
+                                                    ErrorResponse(conflict.first, conflict.second),
+                                                    HttpStatusCode.Conflict
+                                            )
+                                            return@post
+                                        }
+                                        val lease = transactionLeases[readerName]
+                                        if (lease?.client == client && lease.state == "outcome_unknown") {
+                                            call.respondMaybeEncrypted(
+                                                    ErrorResponse(
+                                                            "The previous command outcome is unknown. Close the channel and restart the transaction.",
+                                                            "outcome_unknown"
+                                                    ),
+                                                    HttpStatusCode.Conflict
+                                            )
+                                            return@post
+                                        }
                                         val aid = req.aid ?: ""
-                                        val channel = activeChannels["$readerName:$aid"]
+                                        val key = ChannelKey(client, readerName, aid)
+                                        val channel = activeChannels[key]
 
                                         if (channel == null) {
                                             call.respondMaybeEncrypted(
@@ -740,13 +876,37 @@ class RemoService : Service() {
                                         }
 
                                         val command = hexToBytes(req.apdu)
-                                        val response =
-                                                transmitCardAware(
-                                                        readerName,
-                                                        aid,
-                                                        channel,
-                                                        command
-                                                )
+                                        val commandHash = apduHash(command)
+                                        transactionLeases[readerName]?.apply {
+                                            inFlightAPDU = commandHash
+                                            updatedAt = System.currentTimeMillis()
+                                            persistTransactionLeases()
+                                        }
+                                        val response = try {
+                                            transmitCardAware(
+                                                    key,
+                                                    readerName,
+                                                    channel,
+                                                    command
+                                            ).also {
+                                                transactionLeases[readerName]?.apply {
+                                                    lastConfirmedAPDU = commandHash
+                                                    inFlightAPDU = null
+                                                    state = "active"
+                                                    updatedAt = System.currentTimeMillis()
+                                                    rssi = (smartcardService as? BleSmartcardService)
+                                                            ?.currentRssi(readerName)
+                                                }
+                                                persistTransactionLeases()
+                                            }
+                                        } catch (error: Exception) {
+                                            transactionLeases[readerName]?.apply {
+                                                state = "outcome_unknown"
+                                                updatedAt = System.currentTimeMillis()
+                                            }
+                                            persistTransactionLeases()
+                                            throw error
+                                        }
                                         call.respondMaybeEncrypted(
                                                 TransmitResponse(bytesToHex(response))
                                         )
@@ -769,6 +929,7 @@ class RemoService : Service() {
                             post("/sendRawApdu") {
                                 try {
                                     Log.d(TAG, "POST /sendRawApdu")
+                                    val client = clientID(call)
                                     val req = call.receiveMaybeEncrypted<ApduRequest>()
                                     val readers = smartcardService?.readers ?: emptyArray()
                                     val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
@@ -777,6 +938,14 @@ class RemoService : Service() {
                                         call.respondMaybeEncrypted(
                                                 ErrorResponse("Reader not found"),
                                                 HttpStatusCode.NotFound
+                                        )
+                                        return@post
+                                    }
+                                    val conflict = leaseConflict(reader.name, client)
+                                    if (conflict != null) {
+                                        call.respondMaybeEncrypted(
+                                                ErrorResponse(conflict.first, conflict.second),
+                                                HttpStatusCode.Conflict
                                         )
                                         return@post
                                     }
@@ -797,8 +966,17 @@ class RemoService : Service() {
                                             readerLocks.getOrPut(reader.name) {
                                                 kotlinx.coroutines.sync.Mutex()
                                             }
+                                    var rawOutcomeUnknown = false
                                     mutex.lock()
                                     try {
+                                        transactionLeases[reader.name] = TransactionLease(
+                                                client = client,
+                                                reader = reader.name,
+                                                aid = null,
+                                                rssi = (smartcardService as? BleSmartcardService)
+                                                        ?.currentRssi(reader.name)
+                                        )
+                                        persistTransactionLeases()
                                         val session = reader.openSession()
                                         // Raw APDU in OMAPI usually means open logical channel to
                                         // default eUICC AID and transmit
@@ -813,13 +991,41 @@ class RemoService : Service() {
                                             return@post
                                         }
                                         val command = hexToBytes(req.apdu)
-                                        val response = transmitWithChunking(channel, command)
+                                        val commandHash = apduHash(command)
+                                        transactionLeases[reader.name]?.apply {
+                                            inFlightAPDU = commandHash
+                                            updatedAt = System.currentTimeMillis()
+                                        }
+                                        persistTransactionLeases()
+                                        val response = try {
+                                            transmitWithChunking(channel, command).also {
+                                                transactionLeases[reader.name]?.apply {
+                                                    inFlightAPDU = null
+                                                    lastConfirmedAPDU = commandHash
+                                                    updatedAt = System.currentTimeMillis()
+                                                }
+                                                persistTransactionLeases()
+                                            }
+                                        } catch (error: Exception) {
+                                            rawOutcomeUnknown = true
+                                            transactionLeases[reader.name]?.apply {
+                                                state = "outcome_unknown"
+                                                updatedAt = System.currentTimeMillis()
+                                            }
+                                            persistTransactionLeases()
+                                            throw error
+                                        }
                                         channel.close()
                                         session.close()
                                         call.respondMaybeEncrypted(
                                                 TransmitResponse(bytesToHex(response))
                                         )
                                     } finally {
+                                        if (!rawOutcomeUnknown &&
+                                                activeChannels.keys.none { it.reader == reader.name && it.client == client }) {
+                                            transactionLeases.remove(reader.name)
+                                            persistTransactionLeases()
+                                        }
                                         mutex.unlock()
                                     }
                                 } catch (e: Exception) {
@@ -838,16 +1044,28 @@ class RemoService : Service() {
                             post("/closeChannel") {
                                 try {
                                     Log.d(TAG, "POST /closeChannel")
+                                    val client = clientID(call)
                                     val req =
                                             call.receiveMaybeEncrypted<
                                                     OpenChannelRequest>() // reuse aids
                                     val readers = smartcardService?.readers ?: emptyArray()
                                     val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
 
-                                    req.aids.forEach { aid ->
-                                        val channelKey = "$readerName:$aid"
-                                        activeChannels.remove(channelKey)?.close()
-                                        cardAuthorizationStates.remove(channelKey)?.challenge?.fill(0)
+                                    val requested = req.aids.map { it.uppercase() }.toSet()
+                                    activeChannels.keys
+                                            .filter { key ->
+                                                key.client == client && key.reader == readerName &&
+                                                        (requested.isEmpty() || key.aid.uppercase() in requested)
+                                            }
+                                            .forEach { key ->
+                                                activeChannels.remove(key)?.close()
+                                                cardAuthorizationStates.remove(key)?.challenge?.fill(0)
+                                            }
+                                    if (activeChannels.keys.none { it.reader == readerName && it.client == client }) {
+                                        transactionLeases.computeIfPresent(readerName) { _, lease ->
+                                            if (lease.client == client) null else lease
+                                        }
+                                        persistTransactionLeases()
                                     }
                                     call.respondMaybeEncrypted(SuccessResponse(true))
                                 } catch (e: Exception) {
@@ -865,7 +1083,33 @@ class RemoService : Service() {
 
                             get("/listChannels") {
                                 Log.d(TAG, "GET /listChannels")
-                                call.respond(ListChannelsResponse(activeChannels.keys.toList()))
+                                val client = clientID(call)
+                                call.respond(
+                                        ListChannelsResponse(
+                                                activeChannels.keys
+                                                        .filter { it.client == client }
+                                                        .map { "${it.reader}:${it.aid}" }
+                                        )
+                                )
+                            }
+
+                            get("/transactionStatus") {
+                                call.respond(
+                                        TransactionStatusResponse(
+                                                transactionLeases.values.map { lease ->
+                                                    TransactionInfo(
+                                                            reader = lease.reader,
+                                                            client = lease.client,
+                                                            state = lease.state,
+                                                            aid = lease.aid,
+                                                            updatedAt = lease.updatedAt,
+                                                            rssi = lease.rssi,
+                                                            lastConfirmedAPDU = lease.lastConfirmedAPDU,
+                                                            uncertainAPDU = lease.inFlightAPDU
+                                                    )
+                                                }
+                                        )
+                                )
                             }
 
                             post("/updateSettings") {
@@ -874,7 +1118,7 @@ class RemoService : Service() {
                                         getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
                                 prefs.edit().apply {
                                     req.port?.let { putInt("port", it) }
-                                    req.password?.let { putString("password", it) }
+                                    req.password?.let { HTTPPasswordStore(this@RemoService).save(it) }
                                     req.singleChannel?.let { putBoolean("single_channel", it) }
                                     apply()
                                 }
@@ -942,12 +1186,11 @@ class RemoService : Service() {
      * A client that already sends BF71 remains authoritative and is never authenticated twice.
      */
     private suspend fun transmitCardAware(
+            channelKey: ChannelKey,
             readerName: String,
-            aid: String,
             channel: SmartcardChannel,
             command: ByteArray
     ): ByteArray {
-        val channelKey = "$readerName:$aid"
         val state =
                 cardAuthorizationStates.getOrPut(channelKey) {
                     CardAuthorizationState(eid = slotEids[readerName])
@@ -1046,6 +1289,64 @@ class RemoService : Service() {
             if (response.size < 2) "truncated"
             else "%02X%02X".format(response[response.size - 2], response.last())
 
+    private fun apduHash(command: ByteArray): String =
+            MessageDigest.getInstance("SHA-256")
+                    .digest(command)
+                    .joinToString("") { "%02x".format(it) }
+
+    @Synchronized
+    private fun persistTransactionLeases() {
+        val array = org.json.JSONArray()
+        transactionLeases.values.forEach { lease ->
+            array.put(
+                    org.json.JSONObject()
+                            .put("reader", lease.reader)
+                            .put("client", lease.client)
+                            .put("aid", lease.aid ?: org.json.JSONObject.NULL)
+                            .put("state", lease.state)
+                            .put("updatedAt", lease.updatedAt)
+                            .put("rssi", lease.rssi ?: org.json.JSONObject.NULL)
+                            .put("lastConfirmedAPDU", lease.lastConfirmedAPDU ?: org.json.JSONObject.NULL)
+                            .put("inFlightAPDU", lease.inFlightAPDU ?: org.json.JSONObject.NULL)
+            )
+        }
+        getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putString(TRANSACTION_JOURNAL_KEY, array.toString())
+                .apply()
+    }
+
+    private fun restoreTransactionLeases() {
+        val raw = getSharedPreferences("remoble_prefs", Context.MODE_PRIVATE)
+                .getString(TRANSACTION_JOURNAL_KEY, null) ?: return
+        runCatching {
+            val array = org.json.JSONArray(raw)
+            for (index in 0 until array.length()) {
+                val value = array.getJSONObject(index)
+                val reader = value.getString("reader")
+                val previousState = value.optString("state", "recovering")
+                val inFlight = value.optString("inFlightAPDU")
+                        .takeIf { it.isNotEmpty() && it != "null" }
+                transactionLeases[reader] = TransactionLease(
+                        client = value.getString("client"),
+                        reader = reader,
+                        aid = value.optString("aid").takeIf { it.isNotEmpty() && it != "null" },
+                        state = if (inFlight != null) "outcome_unknown"
+                        else if (previousState == "active") "recovering" else previousState,
+                        updatedAt = System.currentTimeMillis(),
+                        rssi = value.optInt("rssi").takeIf { !value.isNull("rssi") },
+                        lastConfirmedAPDU = value.optString("lastConfirmedAPDU")
+                                .takeIf { it.isNotEmpty() && it != "null" },
+                        inFlightAPDU = inFlight
+                )
+            }
+            persistTransactionLeases()
+        }.onFailure { error ->
+            Log.w(TAG, "Ignoring invalid transaction journal", error)
+            transactionLeases.clear()
+        }
+    }
+
     private fun isReaderAllowed(readerName: String): Boolean {
         val allowed = allowedReaders ?: return true
         if (readerName in allowed) return true
@@ -1055,9 +1356,62 @@ class RemoService : Service() {
         }
     }
 
+    private fun clientID(call: ApplicationCall): String =
+            call.request.header("X-Remoble-Client")
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: call.request.origin.remoteHost
+
+    /**
+     * Mirrors the iOS reader lease: a second client cannot interrupt an active transaction.
+     * A stale reservation without a live channel can be deliberately recovered after ten
+     * consecutive attempts by the new client.
+     */
+    private fun leaseConflict(
+            readerName: String,
+            client: String,
+            allowTakeover: Boolean = true
+    ): Pair<String, String>? {
+        val lease = transactionLeases[readerName] ?: return null
+        if (lease.client == client) return null
+
+        val hasLiveChannel = activeChannels.keys.any {
+            it.reader == readerName && it.client == lease.client
+        }
+        val stale = !hasLiveChannel &&
+                System.currentTimeMillis() - lease.updatedAt >= 30_000
+        val attemptKey = "$readerName|$client"
+        if (allowTakeover && stale) {
+            val attempts = (takeoverAttempts[attemptKey] ?: 0) + 1
+            takeoverAttempts[attemptKey] = attempts
+            if (attempts >= 10) {
+                closeReaderState(readerName)
+                transactionLeases.remove(readerName, lease)
+                takeoverAttempts.remove(attemptKey)
+                persistTransactionLeases()
+                return null
+            }
+            return "Reader is reserved by another client's stale transaction; override attempt $attempts of 10" to
+                    "reader_busy"
+        }
+        takeoverAttempts.remove(attemptKey)
+        return "Reader is reserved by another client's active transaction" to "reader_busy"
+    }
+
+    private fun closeClientChannels(client: String, readerName: String) {
+        activeChannels.keys
+                .filter { it.client == client && it.reader == readerName }
+                .forEach { key ->
+                    runCatching { activeChannels.remove(key)?.close() }
+                    cardAuthorizationStates.remove(key)?.challenge?.fill(0)
+                }
+    }
+
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
         listeningPort = 0
+        isRunning = false
+        bleService = null
         serverStatusMessage = null
         wakeLock?.let { if (it.isHeld) it.release() }
         server?.stop(1000, 2000)
@@ -1097,24 +1451,21 @@ class RemoService : Service() {
             } catch (e: Exception) {}
         }
         activeSessions.clear()
+        transactionLeases.clear()
+        takeoverAttempts.clear()
     }
 
     private fun closeReaderState(readerName: String) {
-        val prefix = "$readerName:"
-        val channelIterator = activeChannels.iterator()
-        while (channelIterator.hasNext()) {
-            val entry = channelIterator.next()
-            if (entry.key.startsWith(prefix)) {
-                runCatching { entry.value.close() }
-                channelIterator.remove()
-            }
-        }
+        activeChannels.keys
+                .filter { it.reader == readerName }
+                .forEach { key -> runCatching { activeChannels.remove(key)?.close() } }
         cardAuthorizationStates.keys
-                .filter { it.startsWith(prefix) }
+                .filter { it.reader == readerName }
                 .forEach { key ->
                     cardAuthorizationStates.remove(key)?.challenge?.fill(0)
                 }
         activeSessions.remove(readerName)?.let { runCatching { it.close() } }
+        transactionLeases.remove(readerName)
     }
 
     private fun decrypt(encrypted: String, sessionId: String? = null): String {
