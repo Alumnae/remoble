@@ -74,6 +74,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     private var manuallyDisconnectedIDs = Set<UUID>()
     private var transmittingReaderIDs = Set<UUID>()
     private var rssiPollingIDs = Set<UUID>()
+    private var pendingRenamedReaders: [UUID: String] = [:]
     private let defaults = UserDefaults.standard
     private var httpPasswordValue = ""
     private lazy var server = RemoHTTPServer(api: self)
@@ -181,12 +182,11 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
         }
     }
 
-    private func pinKey(for reader: BLEReader) -> String { "nble.pin.\(reader.id.uuidString)" }
-
-    func savedPin(for reader: BLEReader) -> String { defaults.string(forKey: pinKey(for: reader)) ?? "" }
+    func savedPin(for reader: BLEReader) -> String { BLEPinStore.load(for: reader.id, legacyDefaults: defaults) }
 
     private func clearSavedPin(for reader: BLEReader) {
-        defaults.removeObject(forKey: pinKey(for: reader))
+        BLEPinStore.delete(for: reader.id)
+        defaults.removeObject(forKey: "nble.pin.\(reader.id.uuidString)")
     }
 
     /// Never retry a rejected cached credential in the background. Remove only
@@ -274,29 +274,17 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
             let updated = BLEReader(id: reader.id, name: prefix + suffix,
                                     kind: reader.kind, peripheral: reader.peripheral)
 
-            // Persist before releasing the link: a writer may restart immediately after the
-            // accepted APDU, and its first background reconnect must use the new credential.
-            defaults.set(newPIN, forKey: pinKey(for: reader))
+            // Match NekokoLPA2 and keep the already authenticated session alive. An immediate
+            // disconnect/reconnect races the writer's configuration commit and can make SELECT
+            // report that every AID was rejected until the reader is manually toggled.
+            try BLEPinStore.save(newPIN, for: reader.id)
             authenticationBlockedReaderIDs.remove(reader.id)
             manuallyDisconnectedIDs.remove(reader.id)
+            pendingRenamedReaders[reader.id] = updated.name
             if let index = readers.firstIndex(where: { $0.id == reader.id }) { readers[index] = updated }
             if selectedReader?.id == reader.id { selectedReader = updated }
             remember(updated)
-            server.invalidateChannels(for: reader)
-
-            retickInProgressIDs.insert(reader.id)
-            session.invalidate()
-            sessions.removeValue(forKey: reader.id)
-            connectedReaderIDs.remove(reader.id)
-            central.cancelPeripheralConnection(reader.peripheral)
-            connectionStatus = "Updated as \(updated.name); waiting for restart"
-
-            Task { @MainActor [weak self] in
-                try? await Task<Never, Never>.sleep(nanoseconds: 2_000_000_000)
-                guard let self else { return }
-                self.retickInProgressIDs.remove(reader.id)
-                self.scheduleAutoReconnect(reader.id)
-            }
+            connectionStatus = "Updated as \(updated.name); connection remains active"
             return true
         } catch {
             connectionStatus = "Name/PIN update failed: \(reader.name)"
@@ -347,8 +335,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
                 authenticationBlockedReaderIDs.remove(reader.id)
                 remember(reader)
                 if reader.kind == .nble {
-                    defaults.set(pin.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
-                                 forKey: pinKey(for: reader))
+                    try BLEPinStore.save(pin, for: reader.id)
                 }
                 startRSSIPolling(reader)
                 return
@@ -658,10 +645,21 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
         // CoreBluetooth can retain an old six-character 9eSIM name after the
         // card starts advertising its eight-digit TYBLE UID. Authentication
         // must use the current advertised UID, so it takes precedence here.
-        let name = [advertisedName, platformName]
+        let scannedName = [advertisedName, platformName]
             .compactMap { $0 }
             .first(where: TYBLEProtocol.isDeviceName)
             ?? platformName ?? advertisedName ?? "BLE card"
+        let name: String
+        if let expected = pendingRenamedReaders[peripheral.identifier] {
+            if scannedName.caseInsensitiveCompare(expected) == .orderedSame {
+                pendingRenamedReaders.removeValue(forKey: peripheral.identifier)
+                name = scannedName
+            } else {
+                name = expected
+            }
+        } else {
+            name = scannedName
+        }
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         guard let kind = Self.detect(name: name, services: services) else { return }
         updateRSSI(RSSI.intValue, for: peripheral.identifier)
@@ -1090,9 +1088,10 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
             }
             if savedPin(for: reader).isEmpty,
                let oldID = duplicateIDs.first(where: {
-                   !(defaults.string(forKey: "nble.pin.\($0.uuidString)") ?? "").isEmpty
-               }), let oldPIN = defaults.string(forKey: "nble.pin.\(oldID.uuidString)") {
-                defaults.set(oldPIN, forKey: pinKey(for: reader))
+                   !BLEPinStore.load(for: $0, legacyDefaults: defaults).isEmpty
+               }) {
+                let oldPIN = BLEPinStore.load(for: oldID, legacyDefaults: defaults)
+                try? BLEPinStore.save(oldPIN, for: reader.id)
             }
             for id in duplicateIDs {
                 sessions[id]?.invalidate()
@@ -1104,6 +1103,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
                 connectingReaderIDs.remove(id)
                 enabledReaderIDs.remove(id)
                 authenticationBlockedReaderIDs.remove(id)
+                BLEPinStore.delete(for: id)
                 defaults.removeObject(forKey: "nble.pin.\(id.uuidString)")
             }
             readers.removeAll { duplicateIDs.contains($0.id) }
