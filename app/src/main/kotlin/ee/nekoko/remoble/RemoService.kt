@@ -431,7 +431,6 @@ class RemoService : Service() {
                             val channel = session.openLogicalChannel(aidBytes)
                             if (channel != null) {
                                 foundAid = aid
-                                Log.i(TAG, "Found working AID for ${reader.name}: $aid")
 
                                 // Try to get EID using this channel
                                 try {
@@ -439,7 +438,6 @@ class RemoService : Service() {
                                     val getEidCmd = hexToBytes("80E2910006BF3E035C015A")
                                     val response = transmitWithChunking(channel, getEidCmd)
                                     val respHex = bytesToHex(response)
-                                    Log.i(TAG, "Transmit Response: $respHex")
 
                                     if (respHex == "6881") {
                                         channel.close()
@@ -449,7 +447,6 @@ class RemoService : Service() {
                                     if (response.isNotEmpty() && response[0] == 0xbf.toByte()) {
                                         if (respHex.length >= 10 + 32) {
                                             foundEid = respHex.substring(10, 10 + 32).uppercase()
-                                            Log.i(TAG, "EID: $foundEid")
                                         }
                                     }
                                 } catch (e: Exception) {
