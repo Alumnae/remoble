@@ -71,7 +71,9 @@ class BleSmartcardService(
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
     private val adapter: BluetoothAdapter? = manager?.adapter
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val pinStore = BLEPinStore(context)
     private val foundReaders = ConcurrentHashMap<String, BleReader>()
+    private val pendingRenamedReaders = ConcurrentHashMap<String, String>()
     @Volatile private var scanning = false
     @Volatile private var closed = false
 
@@ -122,7 +124,7 @@ class BleSmartcardService(
 
     fun savedPin(readerName: String): String =
             findReader(readerName)?.let { reader ->
-                prefs.getString(pinKey(reader), "")
+                pinStore.load(reader.device.address, prefs, pinKey(reader))
             }.orEmpty()
 
     /**
@@ -149,25 +151,13 @@ class BleSmartcardService(
             val prefix = oldName.dropLast(oldName.length.coerceAtMost(6))
             val newName = prefix + newSuffix
 
-            // Persist the new credential before releasing GATT. If the writer restarts before the
-            // verification reconnect, background recovery must never retry the obsolete PIN.
-            prefs.edit().putString(pinKey(reader), newPin).apply()
+            // Match NekokoLPA2: keep the already authenticated transport alive after the accepted
+            // management APDU. Forcing an immediate reconnect can race the writer's configuration
+            // commit and leave its card application temporarily unavailable to SELECT AID.
+            pinStore.save(reader.device.address, newPin)
             reader.displayName = newName
+            pendingRenamedReaders[reader.device.address.uppercase()] = newName
             remember(reader)
-            runCatching { active.close() }
-            if (reader.profile === active) reader.profile = null
-            executor.execute { onReadersChanged() }
-
-            Thread.sleep(1_500)
-            try {
-                reader.profile = reader.connectProfile(newPin)
-            } catch (error: Throwable) {
-                throw IllegalStateException(
-                        "Name and PIN were saved on the reader, but verification reconnect failed. " +
-                                "Wait for it to advertise as $newName and reconnect with the new PIN.",
-                        error
-                )
-            }
             executor.execute { onReadersChanged() }
             return newName
         }
@@ -195,6 +185,7 @@ class BleSmartcardService(
         reader.disconnect()
         reader.remembered = false
         removeRemembered(reader)
+        pinStore.delete(reader.device.address)
         prefs.edit().remove(pinKey(reader)).apply()
         foundReaders.remove(reader.device.address.uppercase(), reader)
         executor.execute { onReadersChanged() }
@@ -260,13 +251,19 @@ class BleSmartcardService(
         val platform = runCatching { result.device.name.orEmpty() }.getOrDefault("")
         // Android can cache an older six-character 9eSIM name. TYBLE/B1
         // authentication needs the live advertised eight-digit UID.
-        val displayName = listOf(advertised, platform)
+        val scannedName = listOf(advertised, platform)
                 .firstOrNull(TybleProtocol::isDeviceName)
                 ?: platform.ifBlank { advertised }.ifBlank { "BLE eUICC" }
+        val address = result.device.address.uppercase()
+        val displayName = pendingRenamedReaders[address]?.let { expected ->
+            if (scannedName.equals(expected, ignoreCase = true)) {
+                pendingRenamedReaders.remove(address, expected)
+                scannedName
+            } else expected
+        } ?: scannedName
         val services = result.scanRecord?.serviceUuids.orEmpty().map(ParcelUuid::getUuid).toSet()
         val type = BleProfileFactory.detect(displayName, services) ?: return
 
-        val address = result.device.address.uppercase()
         // The advertised name can change and is not an identity. Keep the
         // RemoCard slot stable and unique by Bluetooth MAC.
         val readerName = "ble:$type|$address"
@@ -403,18 +400,19 @@ class BleSmartcardService(
         fun connectProfile(pinOverride: String? = null): BleProfile {
             val client = GattClient(context, device)
             val configuredPin = pinOverride
-                    ?: prefs.getString(pinKey(this), null)?.takeIf(NbleAuth::isHexPin)
+                    ?: pinStore.load(device.address, prefs, pinKey(this)).takeIf(NbleAuth::isHexPin)
             val newProfile = BleProfileFactory.create(type, client, displayName, configuredPin)
             try {
                 newProfile.connect()
                 remember(this)
                 if (pinOverride != null) {
-                    prefs.edit().putString(pinKey(this), pinOverride).apply()
+                    pinStore.save(device.address, pinOverride)
                 }
                 return newProfile
             } catch (error: Throwable) {
                 runCatching { newProfile.close() }
                 if (configuredPin != null && isPinFailure(error)) {
+                    pinStore.delete(device.address)
                     prefs.edit().remove(pinKey(this)).apply()
                 }
                 throw error
