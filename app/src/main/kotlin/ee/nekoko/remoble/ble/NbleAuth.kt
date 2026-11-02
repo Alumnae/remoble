@@ -29,6 +29,15 @@ internal object NbleAuth {
         return "%06X".format(crc and 0xFFFFFF)
     }
 
+    /** Builds the writer-management APDU used by NekokoLPA2 for name/PIN updates. */
+    fun credentialUpdateApdu(cla: Int, nameSuffix: String, password: String): ByteArray {
+        require(cla == 0x30 || cla == 0x80) { "Unsupported credential-update CLA" }
+        val name = nameSuffix.trim().uppercase()
+        require(isHexPin(name)) { "Bluetooth name suffix must contain 6 hexadecimal characters" }
+        val pin = calculatePasswordHex(password)
+        return "%02X27000009%s%s%s".format(cla, "111111", name, pin).hexToBytes()
+    }
+
     fun buildTripleDesKey(deviceName: String, password: String): ByteArray {
         val identifier = deviceName.trim().takeLast(6).uppercase()
         require(identifier.length >= 2 && identifier.takeLast(2).matches(Regex("^[0-9A-F]{2}$"))) {

@@ -125,6 +125,54 @@ class BleSmartcardService(
                 prefs.getString(pinKey(reader), "")
             }.orEmpty()
 
+    /**
+     * Changes the six hexadecimal characters advertised after the fixed device prefix and the
+     * six-character hexadecimal PIN. The command is intentionally limited to NBLE readers: B1
+     * derives its authentication material from its advertised UID and has no equivalent command.
+     */
+    fun updateNbleCredentials(readerName: String, nameSuffix: String, pin: String): String {
+        val reader = findReader(readerName) ?: error("Bluetooth reader not found")
+        require(reader.type == BleProfileFactory.TYPE_NBLE) {
+            "This Bluetooth reader does not support changing its name or PIN"
+        }
+        val newSuffix = nameSuffix.trim().uppercase()
+        val newPin = pin.trim().uppercase()
+        require(NbleAuth.isHexPin(newSuffix)) { "Enter 6 hexadecimal characters for the Bluetooth name" }
+        require(NbleAuth.isHexPin(newPin)) { "Enter a 6-character hexadecimal PIN" }
+
+        synchronized(reader.lock) {
+            reader.settleNbleIfRequired()
+            val active = reader.profile ?: reader.connectProfile()
+            active.updateCredentials(newSuffix, newPin)
+
+            val oldName = reader.displayName
+            val prefix = oldName.dropLast(oldName.length.coerceAtMost(6))
+            val newName = prefix + newSuffix
+
+            // Persist the new credential before releasing GATT. If the writer restarts before the
+            // verification reconnect, background recovery must never retry the obsolete PIN.
+            prefs.edit().putString(pinKey(reader), newPin).apply()
+            reader.displayName = newName
+            remember(reader)
+            runCatching { active.close() }
+            if (reader.profile === active) reader.profile = null
+            executor.execute { onReadersChanged() }
+
+            Thread.sleep(1_500)
+            try {
+                reader.profile = reader.connectProfile(newPin)
+            } catch (error: Throwable) {
+                throw IllegalStateException(
+                        "Name and PIN were saved on the reader, but verification reconnect failed. " +
+                                "Wait for it to advertise as $newName and reconnect with the new PIN.",
+                        error
+                )
+            }
+            executor.execute { onReadersChanged() }
+            return newName
+        }
+    }
+
     fun connectReader(readerName: String, pin: String? = null): SmartcardSession? {
         val reader = findReader(readerName) ?: return null
         reader.throwIfSettling()
@@ -241,6 +289,11 @@ class BleSmartcardService(
             if (wasRemembered) remember(replacement)
             executor.execute { onReadersChanged() }
         } else {
+            if (existing.displayName != displayName && type == BleProfileFactory.TYPE_NBLE) {
+                existing.displayName = displayName
+                if (existing.remembered) remember(existing)
+                executor.execute { onReadersChanged() }
+            }
             existing.lastSeen = System.currentTimeMillis()
             existing.lastRssi = result.rssi
         }
@@ -313,15 +366,15 @@ class BleSmartcardService(
 
     private inner class BleReader(
             override val name: String,
-            val displayName: String,
+            @Volatile var displayName: String,
             val type: String,
             val device: BluetoothDevice,
             @Volatile var remembered: Boolean = false,
             @Volatile var lastRssi: Int? = null
     ) : SmartcardReader {
         @Volatile var lastSeen: Long = System.currentTimeMillis()
-        private val lock = Any()
-        private var profile: BleProfile? = null
+        val lock = Any()
+        var profile: BleProfile? = null
         private var settleDeadlineMs = 0L
         private var nextSettleProbeMs = 0L
         private var settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
@@ -347,7 +400,7 @@ class BleSmartcardService(
             profile = connectProfile(pin?.trim()?.uppercase()?.takeIf(NbleAuth::isHexPin))
         }
 
-        private fun connectProfile(pinOverride: String? = null): BleProfile {
+        fun connectProfile(pinOverride: String? = null): BleProfile {
             val client = GattClient(context, device)
             val configuredPin = pinOverride
                     ?: prefs.getString(pinKey(this), null)?.takeIf(NbleAuth::isHexPin)
@@ -447,7 +500,7 @@ class BleSmartcardService(
          * channel here would send SELECT while the modem is still resetting the card, which is
          * the sequence that leaves affected 9eSIM readers requiring a physical re-seat.
          */
-        private fun settleNbleIfRequired() {
+        fun settleNbleIfRequired() {
             if (type != BleProfileFactory.TYPE_NBLE || settleDeadlineMs == 0L) return
             val now = System.currentTimeMillis()
             if (now < nextSettleProbeMs) throw settlingException(now)

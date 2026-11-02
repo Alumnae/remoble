@@ -241,6 +241,70 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
         }
     }
 
+    /// Updates the NBLE writer's advertised six-character suffix and PIN with the management
+    /// APDU used by NekokoLPA2. TYBLE/B1 authentication is UID-derived and is deliberately not
+    /// routed through this legacy command.
+    func updateNbleCredentials(_ reader: BLEReader, nameSuffix: String, pin: String) async -> Bool {
+        selectedReader = reader
+        lastError = nil
+        let suffix = nameSuffix.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let newPIN = pin.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard reader.kind == .nble else {
+            lastError = "This Bluetooth reader does not support changing its name or PIN"
+            return false
+        }
+        guard suffix.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil,
+              newPIN.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil else {
+            lastError = "Bluetooth name and PIN must each contain exactly 6 hexadecimal characters"
+            return false
+        }
+
+        setReaderEnabled(reader, enabled: true)
+        do {
+            try await connectThrowing(reader, pin: savedPin(for: reader))
+            guard let session = sessions[reader.id],
+                  let profile = session.profile as? NbleProfile else {
+                throw RemobleError.message("NBLE management session is unavailable")
+            }
+            connectionStatus = "Updating Bluetooth name and PIN…"
+            try await profile.updateCredentials(nameSuffix: suffix, password: newPIN)
+
+            let prefixCount = max(0, reader.name.count - min(6, reader.name.count))
+            let prefix = String(reader.name.prefix(prefixCount))
+            let updated = BLEReader(id: reader.id, name: prefix + suffix,
+                                    kind: reader.kind, peripheral: reader.peripheral)
+
+            // Persist before releasing the link: a writer may restart immediately after the
+            // accepted APDU, and its first background reconnect must use the new credential.
+            defaults.set(newPIN, forKey: pinKey(for: reader))
+            authenticationBlockedReaderIDs.remove(reader.id)
+            manuallyDisconnectedIDs.remove(reader.id)
+            if let index = readers.firstIndex(where: { $0.id == reader.id }) { readers[index] = updated }
+            if selectedReader?.id == reader.id { selectedReader = updated }
+            remember(updated)
+            server.invalidateChannels(for: reader)
+
+            retickInProgressIDs.insert(reader.id)
+            session.invalidate()
+            sessions.removeValue(forKey: reader.id)
+            connectedReaderIDs.remove(reader.id)
+            central.cancelPeripheralConnection(reader.peripheral)
+            connectionStatus = "Updated as \(updated.name); waiting for restart"
+
+            Task { @MainActor [weak self] in
+                try? await Task<Never, Never>.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                self.retickInProgressIDs.remove(reader.id)
+                self.scheduleAutoReconnect(reader.id)
+            }
+            return true
+        } catch {
+            connectionStatus = "Name/PIN update failed: \(reader.name)"
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
     private func connectThrowing(_ reader: BLEReader, pin: String) async throws {
         try ensureConnectionAllowed(for: reader)
         if sessions[reader.id]?.isConnected == true {
@@ -1136,6 +1200,19 @@ final class NbleProfile: BLECardProfile {
             scheduleIdlePing()
         }
         return try await exchange(apdu)
+    }
+
+    func updateCredentials(nameSuffix: String, password: String) async throws {
+        var response = try await transmit(try NbleAuth.credentialUpdateAPDU(
+            cla: 0x30, nameSuffix: nameSuffix, password: password))
+        if response.hex.uppercased().hasSuffix("6E00") {
+            response = try await transmit(try NbleAuth.credentialUpdateAPDU(
+                cla: 0x80, nameSuffix: nameSuffix, password: password))
+        }
+        let status = response.hex.uppercased()
+        guard status.hasSuffix("9000") || status.hasSuffix("6100") || status.contains("9000") else {
+            throw RemobleError.message("Name/PIN update failed (response=\(status))")
+        }
     }
 
     func invalidate() {

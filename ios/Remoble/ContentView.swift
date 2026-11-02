@@ -294,10 +294,14 @@ private struct BLEReaderCard: View {
 
     @State private var showingPINEntry = false
     @State private var pinEntry = ""
+    @State private var showingCredentialUpdate = false
+    @State private var nameSuffix = ""
+    @State private var newPIN = ""
+    @State private var credentialUpdateBusy = false
 
     private var isConnected: Bool { bridge.isConnected(reader) }
     private var isConnecting: Bool { bridge.isConnecting(reader) }
-    private var isBusy: Bool { isConnecting || bridge.isSettling(reader) }
+    private var isBusy: Bool { isConnecting || bridge.isSettling(reader) || credentialUpdateBusy }
     private var isPINValid: Bool {
         pinEntry.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil
     }
@@ -345,7 +349,7 @@ private struct BLEReaderCard: View {
             Toggle(isOn: Binding(
                 get: { bridge.isReaderEnabled(reader) },
                 set: { enabled in
-                    if !enabled { hidePINEntry() }
+                    if !enabled { hidePINEntry(); hideCredentialUpdate() }
                     bridge.setReaderEnabled(reader, enabled: enabled)
                 }
             )) {
@@ -414,6 +418,73 @@ private struct BLEReaderCard: View {
                     .background(Color(uiColor: .secondarySystemGroupedBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
+
+                Divider()
+
+                Button {
+                    if showingCredentialUpdate {
+                        hideCredentialUpdate()
+                    } else {
+                        hidePINEntry()
+                        nameSuffix = String(reader.name.uppercased().suffix(6))
+                        newPIN = ""
+                        showingCredentialUpdate = true
+                    }
+                } label: {
+                    Label("Change Bluetooth name / PIN", systemImage: "slider.horizontal.3")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .disabled(isBusy)
+
+                if showingCredentialUpdate {
+                    VStack(alignment: .leading, spacing: 9) {
+                        TextField("Bluetooth name (6 hex characters)", text: $nameSuffix)
+                            .keyboardType(.asciiCapable)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .font(.system(.body, design: .monospaced))
+                            .onChange(of: nameSuffix) { value in
+                                let clean = sanitizedPIN(value)
+                                if clean != value { nameSuffix = clean }
+                            }
+
+                        SecureField("New PIN (6 hex characters)", text: $newPIN)
+                            .keyboardType(.asciiCapable)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .textContentType(.newPassword)
+                            .font(.system(.body, design: .monospaced))
+                            .onChange(of: newPIN) { value in
+                                let clean = sanitizedPIN(value)
+                                if clean != value { newPIN = clean }
+                            }
+
+                        Text("The fixed name prefix is preserved. The reader may disappear briefly while it restarts; the new PIN is saved before reconnecting.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Button("Cancel", role: .cancel) { hideCredentialUpdate() }
+                            Spacer()
+                            Button("Apply") {
+                                let submittedName = nameSuffix
+                                let submittedPIN = newPIN
+                                credentialUpdateBusy = true
+                                Task {
+                                    let updated = await bridge.updateNbleCredentials(
+                                        reader, nameSuffix: submittedName, pin: submittedPIN)
+                                    credentialUpdateBusy = false
+                                    if updated { hideCredentialUpdate() }
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!isCredentialUpdateValid || credentialUpdateBusy)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
             }
         }
         .padding(.vertical, 5)
@@ -429,6 +500,17 @@ private struct BLEReaderCard: View {
     private func hidePINEntry() {
         pinEntry = ""
         showingPINEntry = false
+    }
+
+    private var isCredentialUpdateValid: Bool {
+        nameSuffix.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil
+            && newPIN.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil
+    }
+
+    private func hideCredentialUpdate() {
+        nameSuffix = ""
+        newPIN = ""
+        showingCredentialUpdate = false
     }
 
     private func sanitizedPIN(_ value: String) -> String {

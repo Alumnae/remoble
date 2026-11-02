@@ -133,6 +133,17 @@ enum NbleAuth {
         return String(format: "%06X", crc & 0xffffff)
     }
 
+    static func credentialUpdateAPDU(cla: UInt8, nameSuffix: String, password: String) throws -> Data {
+        guard cla == 0x30 || cla == 0x80 else {
+            throw RemobleError.message("Unsupported credential-update command")
+        }
+        let name = nameSuffix.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard name.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil else {
+            throw RemobleError.message("Bluetooth name must contain 6 hexadecimal characters")
+        }
+        return try Data(hex: String(format: "%02X27000009", cla) + "111111" + name + passwordHex(password))
+    }
+
     static func key(deviceName: String, password: String) throws -> Data {
         let identifier = String(deviceName.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().suffix(6))
         guard identifier.count >= 2 else { throw RemobleError.message("Invalid BLE card name") }

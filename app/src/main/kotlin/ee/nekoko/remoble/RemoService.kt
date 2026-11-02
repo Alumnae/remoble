@@ -40,7 +40,7 @@ import kotlinx.serialization.json.Json
 
 @Serializable
 data class VersionInfo(
-        val version: String = "0.3.8-beta",
+        val version: String = "0.6.0",
         val deviceName: String = android.os.Build.MODEL,
         val supportedCommands: List<String> =
                 listOf(

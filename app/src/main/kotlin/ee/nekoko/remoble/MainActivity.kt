@@ -250,7 +250,7 @@ class MainActivity : AppCompatActivity() {
 
         sectionTitle("About")
         content.addView(card().apply {
-            addView(valueText("Remoble 0.3.8-beta", 16f))
+            addView(valueText("Remoble 0.6.0", 16f))
             addView(caption("Android 5.0+ · Bluetooth Low Energy · foreground background operation"))
         })
 
@@ -337,6 +337,11 @@ class MainActivity : AppCompatActivity() {
             }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(42)))
         }
         row.addView(detail)
+        if (reader.type == BleProfileFactory.TYPE_NBLE) {
+            row.addView(secondaryButton("Change Bluetooth name / PIN") {
+                showCredentialUpdateDialog(reader)
+            }, matchParams(top = 6))
+        }
 
         var downX = 0f
         row.setOnTouchListener { _, event ->
@@ -405,6 +410,72 @@ class MainActivity : AppCompatActivity() {
         }
         dialog.show()
     }
+
+    private fun showCredentialUpdateDialog(reader: BleReaderSnapshot) {
+        val nameInput = EditText(this).apply {
+            hint = "Bluetooth name (6 hex characters)"
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+            setText(reader.displayName.takeLast(6).uppercase())
+            filters = hexFilters()
+        }
+        val pinInput = EditText(this).apply {
+            hint = "New PIN (6 hex characters)"
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            transformationMethod = PasswordTransformationMethod.getInstance()
+            filters = hexFilters()
+        }
+        val fields = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(nameInput, matchParams())
+            addView(pinInput, matchParams(top = 10))
+        }
+        val dialog = AlertDialog.Builder(this)
+                .setTitle("Change Bluetooth name and PIN")
+                .setMessage("Supported NBLE readers use a fixed prefix. Choose the final 6 hexadecimal characters and a new 6-character hexadecimal PIN. Keep the new PIN safe.")
+                .setView(fields)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Apply", null)
+                .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val suffix = nameInput.text.toString().uppercase()
+                val pin = pinInput.text.toString().uppercase()
+                when {
+                    !NbleAuth.isHexPin(suffix) -> nameInput.error = "Enter exactly 6 hexadecimal characters"
+                    !NbleAuth.isHexPin(pin) -> pinInput.error = "Enter exactly 6 hexadecimal characters"
+                    else -> {
+                        dialog.dismiss()
+                        Toast.makeText(this, "Updating reader…", Toast.LENGTH_SHORT).show()
+                        worker.execute {
+                            val result = runCatching {
+                                smartcardService?.updateNbleCredentials(reader.readerName, suffix, pin)
+                                        ?: error("Bluetooth service unavailable")
+                            }
+                            runOnUiThread {
+                                if (result.isSuccess) {
+                                    Toast.makeText(this, "Updated and reconnected as ${result.getOrNull()}", Toast.LENGTH_LONG).show()
+                                } else {
+                                    Toast.makeText(this, result.exceptionOrNull()?.message ?: "Update failed", Toast.LENGTH_LONG).show()
+                                }
+                                refreshReaders()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun hexFilters(): Array<InputFilter> = arrayOf(
+            InputFilter { source, _, _, _, _, _ ->
+                source.toString().uppercase().filter { it in "0123456789ABCDEF" }
+            },
+            InputFilter.LengthFilter(6)
+    )
 
     private fun refreshClientList() {
         if (!::clientsContainer.isInitialized) return

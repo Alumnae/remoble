@@ -9,6 +9,9 @@ import java.util.TimerTask
 internal interface BleProfile : AutoCloseable {
     fun connect()
     fun transmit(apdu: ByteArray): ByteArray
+    fun updateCredentials(nameSuffix: String, password: String) {
+        error("This BLE reader does not support changing its name or PIN")
+    }
     fun onProfileSwitchCommitted(): Boolean = false
 }
 
@@ -327,6 +330,18 @@ private class NbleProfile(
             return response.apdu
         } finally {
             scheduleIdlePing()
+        }
+    }
+
+    @Synchronized
+    override fun updateCredentials(nameSuffix: String, password: String) {
+        var response = transmit(NbleAuth.credentialUpdateApdu(0x30, nameSuffix, password))
+        if (response.toHex().uppercase().endsWith("6E00")) {
+            response = transmit(NbleAuth.credentialUpdateApdu(0x80, nameSuffix, password))
+        }
+        val status = response.toHex().uppercase()
+        check(status.endsWith("9000") || status.endsWith("6100") || status.contains("9000")) {
+            "Name/PIN update failed (response=$status)"
         }
     }
 

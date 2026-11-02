@@ -159,4 +159,16 @@ class BleProtocolCodecTest {
         assertEquals("311052", NbleAuth.defaultPasswordForDeviceName("9eSIM250113"))
         assertEquals(24, NbleAuth.buildTripleDesKey("9eSIM250113", "311052").size)
     }
+
+    @Test
+    fun nbleCredentialUpdateMatchesNekokoLpa2() {
+        assertEquals(
+                "3027000009111111A1B2C3D4E5F6",
+                NbleAuth.credentialUpdateApdu(0x30, "a1b2c3", "d4e5f6").toHex().uppercase()
+        )
+        assertEquals(
+                "8027000009111111A1B2C3D4E5F6",
+                NbleAuth.credentialUpdateApdu(0x80, "A1B2C3", "D4E5F6").toHex().uppercase()
+        )
+    }
 }
