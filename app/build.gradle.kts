@@ -20,8 +20,8 @@ android {
         applicationId = "ee.nekoko.remoble"
         minSdk = 21 // Support older devices with SimAlliance
         targetSdk = 34
-        versionCode = 60
-        versionName = "0.6.0"
+        versionCode = 61
+        versionName = "0.6.1"
     }
 
     splits {
