@@ -18,8 +18,7 @@
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
-        android:allowBackup="false"
-        android:fullBackupContent="false"
+        android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="Remoble"
         android:supportsRtl="true"
