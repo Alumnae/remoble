@@ -19,7 +19,7 @@ fi
 
 next_number=$((current_number + 1))
 output_dir="$project_dir/build"
-output_path="$output_dir/Remoble-0.6.0-ios-${next_number}.ipa"
+output_path="$output_dir/Remoble-0.6.1-ios-${next_number}.ipa"
 if [[ -e "$output_path" ]]; then
   print -u2 "Refusing to overwrite existing IPA: $output_path"
   exit 1

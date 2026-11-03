@@ -30,8 +30,8 @@ Supported in the native implementation:
   channel-aware GET RESPONSE, and physical channel cleanup for remote APDUs.
 - Transparent 9eSIM card-level BF71 authorization on the already-open ISD-R
   channel. Remoble records GET EID and the one-time GET EUICC CHALLENGE,
-  obtains a PSK from `https://key.9esim.com/psk?eid=...`, stores it as a
-  device-only Keychain item, and sends BF71 immediately before AUTHENTICATE
+  obtains a PSK from `https://key.9esim.com/psk?eid=...`, keeps a local app
+  fallback, and sends BF71 immediately before AUTHENTICATE
   SERVER. A client that already sends BF71 is detected and is never
   authenticated twice. The observed B0 EID range is fail-closed; other 9eSIM
   models use the exchange only when the service returns a valid key.
