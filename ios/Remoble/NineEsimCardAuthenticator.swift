@@ -116,7 +116,7 @@ final class NineEsimCardAuthenticator {
               let decoded = try? Data(hex: value) else {
             throw RemobleError.message("Card authorization service returned an invalid key")
         }
-        try Self.saveKey(decoded, eid: eid)
+        Self.saveKey(decoded, eid: eid)
         return decoded
     }
 
@@ -135,6 +135,9 @@ final class NineEsimCardAuthenticator {
     private static func account(eid: String) -> String { "b0-psk:\(eid)" }
 
     private static func loadKey(eid: String) -> Data? {
+        if let data = UserDefaults.standard.data(forKey: account(eid: eid)), data.count == 16 {
+            return data
+        }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -145,26 +148,12 @@ final class NineEsimCardAuthenticator {
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data, data.count == 16 else { return nil }
+        UserDefaults.standard.set(data, forKey: account(eid: eid))
         return data
     }
 
-    private static func saveKey(_ key: Data, eid: String) throws {
-        let identity: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account(eid: eid)
-        ]
-        let values: [String: Any] = [
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecValueData as String: key
-        ]
-        var status = SecItemUpdate(identity as CFDictionary, values as CFDictionary)
-        if status == errSecItemNotFound {
-            status = SecItemAdd(identity.merging(values) { _, new in new } as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else {
-            throw RemobleError.message("Unable to store card authorization key (\(status))")
-        }
+    private static func saveKey(_ key: Data, eid: String) {
+        UserDefaults.standard.set(key, forKey: account(eid: eid))
     }
 
     private static func aesCBCEncrypt(key: Data, input: Data) throws -> Data {
