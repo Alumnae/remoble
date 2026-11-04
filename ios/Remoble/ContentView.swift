@@ -100,9 +100,14 @@ private struct BridgeSettingsView: View {
                     }
                     Text("Changing the port restarts the HTTP listener. Update the URL in the compatible remote client to match.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button(bridge.serverRunning ? "Stop HTTP server" : "Start HTTP server") {
-                        bridge.serverRunning ? bridge.stopServer() : bridge.startServer()
+                    Button(
+                        bridge.serverTransitioning
+                            ? (bridge.serverTransitionTarget == true ? "Starting…" : "Stopping…")
+                            : (bridge.serverRunning ? "Stop HTTP server" : "Start HTTP server")
+                    ) {
+                        bridge.toggleServer()
                     }
+                    .disabled(bridge.serverTransitioning)
                 }
 
                 Section("Remote security") {
@@ -135,6 +140,18 @@ private struct BridgeSettingsView: View {
                 Section("Background operation") {
                     valueRow("Audio", audio.status)
                     Text("Play a sound from the Sounds tab to keep audio active while the screen is locked. CoreBluetooth restoration remains enabled independently.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Channel handling") {
+                    Toggle(isOn: Binding(
+                        get: { bridge.ensureSingleChannel },
+                        set: { bridge.setEnsureSingleChannel($0) }
+                    )) {
+                        Label("Ensure one logical channel", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .toggleStyle(CheckboxToggleStyle())
+                    Text("When enabled, opening a new channel for the same remote client closes its previous channel on that card. Other clients and Bluetooth remain connected.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -199,6 +216,8 @@ private struct BridgeSettingsView: View {
                 }
 
                 Section("About") {
+                    valueRow("Version", appVersion)
+                    valueRow("Build", appBuild)
                     valueRow("Compatibility", "iOS 15.6+")
                     Text("Remoble Sounds combines a continuous ambient-noise player with a local, remote-compatible Bluetooth smart-card bridge.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -216,6 +235,14 @@ private struct BridgeSettingsView: View {
             Text(label); Spacer()
             Text(value).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
         }
+    }
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    }
+
+    private var appBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
     }
 }
 
@@ -301,7 +328,7 @@ private struct BLEReaderCard: View {
 
     private var isConnected: Bool { bridge.isConnected(reader) }
     private var isConnecting: Bool { bridge.isConnecting(reader) }
-    private var isBusy: Bool { isConnecting || bridge.isSettling(reader) || credentialUpdateBusy }
+    private var isBusy: Bool { isConnecting || bridge.isEnabling(reader) || bridge.isSettling(reader) || credentialUpdateBusy }
     private var isPINValid: Bool {
         pinEntry.range(of: "^[0-9A-F]{6}$", options: .regularExpression) != nil
     }
@@ -349,14 +376,23 @@ private struct BLEReaderCard: View {
             Toggle(isOn: Binding(
                 get: { bridge.isReaderEnabled(reader) },
                 set: { enabled in
-                    if !enabled { hidePINEntry(); hideCredentialUpdate() }
-                    bridge.setReaderEnabled(reader, enabled: enabled)
+                    if enabled {
+                        Task {
+                            await bridge.enableReaderAfterConnection(
+                                reader, pin: bridge.savedPin(for: reader))
+                        }
+                    } else {
+                        hidePINEntry()
+                        hideCredentialUpdate()
+                        bridge.setReaderEnabled(reader, enabled: false)
+                    }
                 }
             )) {
                 Label("Visible to remote clients", systemImage: "network")
                     .font(.subheadline)
             }
             .toggleStyle(CheckboxToggleStyle())
+            .disabled(isBusy)
 
             if reader.kind == .nble {
                 Divider()
@@ -407,8 +443,10 @@ private struct BLEReaderCard: View {
                             Button(isConnected ? "Reconnect" : "Connect") {
                                 let submittedPIN = pinEntry
                                 hidePINEntry()
-                                bridge.setReaderEnabled(reader, enabled: true)
-                                Task { await bridge.reconnect(reader, pin: submittedPIN) }
+                                Task {
+                                    await bridge.enableReaderAfterConnection(
+                                        reader, pin: submittedPIN, forceReconnect: true)
+                                }
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(!isPINValid || isBusy)
@@ -493,8 +531,10 @@ private struct BLEReaderCard: View {
     private func connectUsingSavedPIN() {
         hidePINEntry()
         bridge.select(reader)
-        bridge.setReaderEnabled(reader, enabled: true)
-        Task { await bridge.connect(reader, pin: bridge.savedPin(for: reader)) }
+        Task {
+            await bridge.enableReaderAfterConnection(
+                reader, pin: bridge.savedPin(for: reader))
+        }
     }
 
     private func hidePINEntry() {

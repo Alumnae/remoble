@@ -20,8 +20,8 @@ android {
         applicationId = "ee.nekoko.remoble"
         minSdk = 21 // Support older devices with SimAlliance
         targetSdk = 34
-        versionCode = 61
-        versionName = "0.6.1"
+        versionCode = 69
+        versionName = "0.6.9"
     }
 
     splits {
@@ -61,6 +61,12 @@ android {
     
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    // VersionInfo is part of the HTTP compatibility response. Generate BuildConfig so it always
+    // reports the Gradle version instead of a stale hard-coded string.
+    buildFeatures {
+        buildConfig = true
     }
 }
 

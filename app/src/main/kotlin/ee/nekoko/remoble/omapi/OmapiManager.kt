@@ -2,7 +2,7 @@ package ee.nekoko.remoble.omapi
 
 import android.content.Context
 import android.os.Build
-import android.util.Log
+import ee.nekoko.remoble.ConsoleLog as Log
 import java.util.concurrent.Executor
 
 interface SmartcardReader {

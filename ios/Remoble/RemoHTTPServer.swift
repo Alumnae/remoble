@@ -1,11 +1,5 @@
 import Foundation
 import Network
-
-private func remobleDebugLog(_ message: @autoclosure () -> String) {
-#if DEBUG
-    NSLog("%@", message())
-#endif
-}
 import UIKit
 import CommonCrypto
 import CryptoKit
@@ -381,7 +375,7 @@ final class RemoHTTPServer: @unchecked Sendable {
                 let aids = decoded?.aids.isEmpty == false
                     ? decoded!.aids
                     : requestedAIDs(from: body)
-                remobleDebugLog("Remoble openChannel using \(aids.count) AID candidates")
+                NSLog("Remoble %@ openChannel using %d AID candidates", api.readerName(reader), aids.count)
                 var opened = try await withReaderLock(reader) {
                     try await openFirst(aids: aids, reader: reader, clientID: clientID)
                 }
@@ -510,12 +504,15 @@ final class RemoHTTPServer: @unchecked Sendable {
         // number exists solely inside this server. Reclaim only this client's
         // previous mappings before opening a different session. Cross-client
         // ownership remains protected by withClientLease.
-        let previousKeys = channels.keys.filter {
-            $0.client == clientID && $0.reader == readerName
-        }
-        if !previousKeys.isEmpty {
-            let previousChannels = Set(previousKeys.compactMap { channels.removeValue(forKey: $0) })
-            remobleDebugLog("Remoble reclaiming same-client channels \(previousChannels.sorted())")
+        if api.ensureSingleChannel {
+            let previousKeys = channels.keys.filter {
+                $0.client == clientID && $0.reader == readerName
+            }
+            if !previousKeys.isEmpty {
+                let previousChannels = Set(previousKeys.compactMap { channels.removeValue(forKey: $0) })
+                NSLog("Remoble %@ reclaiming same-client channels %@", readerName,
+                      previousChannels.sorted().map(String.init).joined(separator: ","))
+            }
         }
 
         // NekokoLPA2's BLE path enables ensureSingleChannel by default. A BLE
@@ -528,7 +525,8 @@ final class RemoHTTPServer: @unchecked Sendable {
                 let cleanup = try? await transmitWithChaining(
                     Data([0x00, 0x70, 0x80, UInt8(channel), 0x00]),
                     reader: reader)
-                remobleDebugLog("Remoble cleanup channel \(channel) -> \(cleanup?.hex ?? "transport-error")")
+                NSLog("Remoble %@ cleanup channel %d -> %@", readerName, channel,
+                      cleanup?.hex ?? "transport-error")
             }
         }
 
@@ -537,12 +535,13 @@ final class RemoHTTPServer: @unchecked Sendable {
         // CHANNEL fall back to the basic channel.
         let terminalCapability = try? await transmitWithChaining(
             try Data(hex: "80AA00000AA908810082010183010700"), reader: reader)
-        remobleDebugLog("Remoble terminal capability -> \(terminalCapability?.hex ?? "transport-error")")
+        NSLog("Remoble %@ terminal capability -> %@", readerName,
+              terminalCapability?.hex ?? "transport-error")
         var logicalChannel = 0
         // B1 follows the ISO correction flow used by NekokoLPA2: request with
         // Le=00, accept 6C01, then resend with Le=01.
         let manage = try await transmitWithChaining(Data([0x00, 0x70, 0x00, 0x00, 0x00]), reader: reader)
-        remobleDebugLog("Remoble manage channel -> \(manage.hex)")
+        NSLog("Remoble %@ manage channel -> %@", readerName, manage.hex)
         if manage.count >= 3,
            manage[manage.count - 2] == 0x90, manage[manage.count - 1] == 0x00,
            let allocated = manage.first, allocated > 0, allocated < 20 {
@@ -563,7 +562,8 @@ final class RemoHTTPServer: @unchecked Sendable {
                 BLEProtocolCodec.selectAid(try Data(hex: aid)),
                 reader: reader,
                 logicalChannel: logicalChannel)
-            remobleDebugLog("Remoble SELECT on channel \(logicalChannel) -> \(response.hex)")
+            NSLog("Remoble %@ SELECT %@ on channel %d -> %@", readerName, aid,
+                  logicalChannel, response.hex)
             guard response.count >= 2 else {
                 selectFailures.append("\(aid.uppercased()):truncated")
                 continue
@@ -716,7 +716,9 @@ final class RemoHTTPServer: @unchecked Sendable {
         }
         guard let eid = api.eid(for: reader),
               NineEsimCardAuthenticator.maySupportAuthorization(
-                eid: eid, readerName: reader.name) else {
+                eid: eid,
+                readerName: reader.name,
+                usesNineEsimTransport: reader.kind == .nble || reader.kind == .tyBle) else {
             return
         }
         let required = NineEsimCardAuthenticator.requiresAuthorization(eid: eid)
@@ -739,7 +741,7 @@ final class RemoHTTPServer: @unchecked Sendable {
                 if required {
                     throw RemobleError.message("No authorization key is available for this card")
                 }
-                remobleDebugLog("Remoble has no optional card authorization key")
+                NSLog("Remoble %@ has no optional card authorization key", api.readerName(reader))
                 return
             }
             var apdu = Data([0x81, 0xE2, 0x91, 0x00, UInt8(request.count)])
@@ -750,10 +752,11 @@ final class RemoHTTPServer: @unchecked Sendable {
                 throw RemobleError.message(
                     "Card BF71 authorization failed (SW=\(response.suffix(2).hex.uppercased()))")
             }
-            remobleDebugLog("Remoble card authorization succeeded")
+            NSLog("Remoble %@ card BF71 authorization succeeded", api.readerName(reader))
         } catch {
             if required { throw error }
-            remobleDebugLog("Remoble optional card authorization skipped: \(error.localizedDescription)")
+            NSLog("Remoble %@ optional card authorization skipped: %@",
+                  api.readerName(reader), error.localizedDescription)
         }
     }
 

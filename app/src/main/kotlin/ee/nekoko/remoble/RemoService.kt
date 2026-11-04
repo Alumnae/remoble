@@ -9,7 +9,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.util.Base64
-import android.util.Log
+import ee.nekoko.remoble.ConsoleLog as Log
 import ee.nekoko.remoble.ble.BleSmartcardService
 import ee.nekoko.remoble.ble.BleCardSettlingException
 import ee.nekoko.remoble.ble.NineEsimBf71
@@ -40,7 +40,7 @@ import kotlinx.serialization.json.Json
 
 @Serializable
 data class VersionInfo(
-        val version: String = "0.6.0",
+        val version: String = BuildConfig.VERSION_NAME,
         val deviceName: String = android.os.Build.MODEL,
         val supportedCommands: List<String> =
                 listOf(
@@ -176,6 +176,9 @@ class RemoService : Service() {
         const val DEFAULT_PORT = 33777
         private const val PORT_ATTEMPTS = 20
         private const val TRANSACTION_JOURNAL_KEY = "http.transaction.journals.v1"
+        // NekokoLPA2 currently gives a RemoCard request 15 seconds. Keep enough headroom for
+        // serialisation and the response while still absorbing the short NBLE reconnect window.
+        private const val OPEN_CHANNEL_READY_WAIT_MS = 12_000L
         private val json = Json {
             ignoreUnknownKeys = true
             prettyPrint = true
@@ -262,6 +265,16 @@ class RemoService : Service() {
         allowedReaders = if (allowedSet != null) allowedSet.toMutableSet() else null
 
         customAids = prefs.getStringSet("custom_aids", null)?.toMutableSet() ?: mutableSetOf()
+
+        // Keep the physical BLE ownership aligned with the visibility checkbox. In particular,
+        // a disabled remembered reader must not remain connected merely because it was restored
+        // when the service started.
+        (smartcardService as? BleSmartcardService)?.readerSnapshots()?.forEach { snapshot ->
+            (smartcardService as? BleSmartcardService)?.setReaderEnabled(
+                    snapshot.readerName,
+                    isReaderAllowed(snapshot.readerName)
+            )
+        }
     }
 
     private fun selectAvailablePort() {
@@ -395,6 +408,9 @@ class RemoService : Service() {
                             refreshEids()
                         }
         bleService = smartcardService as? BleSmartcardService
+        bleService?.readerSnapshots()
+                ?.filterNot { isReaderAllowed(it.readerName) }
+                ?.forEach { bleService?.setReaderEnabled(it.readerName, false) }
         // Reconnect persisted readers off the main thread even when they are not advertising.
         bleExecutor.execute { refreshEids() }
     }
@@ -407,6 +423,10 @@ class RemoService : Service() {
     private fun refreshEids() {
         val readers = smartcardService?.readers ?: return
         readers.forEach { reader ->
+            if (!isReaderAllowed(reader.name)) {
+                Log.d(TAG, "Skipping disabled BLE reader ${reader.name}")
+                return@forEach
+            }
             if ((smartcardService as? BleSmartcardService)?.isReaderSettling(reader.name) == true) {
                 Log.d(TAG, "Skipping EID refresh while ${reader.name} is settling")
                 return@forEach
@@ -431,6 +451,7 @@ class RemoService : Service() {
                             val channel = session.openLogicalChannel(aidBytes)
                             if (channel != null) {
                                 foundAid = aid
+                                Log.i(TAG, "Found working AID for ${reader.name}: $aid")
 
                                 // Try to get EID using this channel
                                 try {
@@ -438,6 +459,7 @@ class RemoService : Service() {
                                     val getEidCmd = hexToBytes("80E2910006BF3E035C015A")
                                     val response = transmitWithChunking(channel, getEidCmd)
                                     val respHex = bytesToHex(response)
+                                    Log.i(TAG, "Transmit Response: $respHex")
 
                                     if (respHex == "6881") {
                                         channel.close()
@@ -447,6 +469,7 @@ class RemoService : Service() {
                                     if (response.isNotEmpty() && response[0] == 0xbf.toByte()) {
                                         if (respHex.length >= 10 + 32) {
                                             foundEid = respHex.substring(10, 10 + 32).uppercase()
+                                            Log.i(TAG, "EID: $foundEid")
                                         }
                                     }
                                 } catch (e: Exception) {
@@ -670,89 +693,104 @@ class RemoService : Service() {
                                             }
                                     mutex.lock()
                                     try {
-                                        if ((smartcardService as? BleSmartcardService)
-                                                        ?.isReaderSettling(reader.name) == true) {
-                                            call.respondMaybeEncrypted(
-                                                    OpenChannelResponse(
-                                                            success = false,
-                                                            reader = reader.name,
-                                                            state = "reconnecting",
-                                                            retryAfterMs = 1_000
-                                                    )
-                                            )
-                                            return@post
-                                        }
                                         var openedChannel: SmartcardChannel? = null
                                         var matchedAid: String? = null
+                                        val bleService = smartcardService as? BleSmartcardService
+                                        val readyDeadline =
+                                                System.currentTimeMillis() + OPEN_CHANNEL_READY_WAIT_MS
+                                        if (bleService?.isReaderSettling(reader.name) == true) {
+                                            // The existing BleSession points at the profile that
+                                            // was deliberately released for proactive REFRESH.
+                                            // Drop only the stale HTTP handles; openSession below
+                                            // performs the STATUS readiness probe without a hard
+                                            // GATT reset.
+                                            closeReaderState(reader.name)
+                                        }
+                                        var hardReconnectRequired = false
+                                        var staleRecoveryUsed = false
+                                        var pass = 0
 
-                                        // A stale NBLE/GATT session can still return card-level
-                                        // failures for every SELECT. In that specific case, reset
-                                        // the remembered reader and repeat the complete AID list
-                                        // once. A single retry prevents an endless reconnect loop
-                                        // when the requested applet really is not installed.
-                                        repeat(2) { attempt ->
-                                            if (openedChannel != null) return@repeat
-                                            val session =
-                                                    if (attempt == 0) {
-                                                        activeSessions.getOrPut(reader.name) {
-                                                            reader.openSession()
-                                                        }
-                                                    } else {
-                                                        Log.w(
-                                                                TAG,
-                                                                "All AIDs failed for ${reader.name}; reconnecting BLE and retrying once"
-                                                        )
-                                                        closeReaderState(reader.name)
-                                                        val reconnected =
-                                                                (smartcardService as? BleSmartcardService)
-                                                                        ?.reconnectReader(reader.name)
-                                                                        ?: reader.openSession()
-                                                        activeSessions[reader.name] = reconnected
-                                                        reconnected
+                                        // NekokoLPA2 treats success=false as a final failure and
+                                        // does not consume retryAfterMs. Keep this HTTP request
+                                        // pending while an NBLE reader completes its quiet/reset
+                                        // window, probe it with STATUS, then retry the whole AID
+                                        // list. A settling pass does not consume the one hard
+                                        // reconnect reserved for a genuinely stale GATT session.
+                                        openLoop@ while (openedChannel == null) {
+                                            val session = try {
+                                                if (hardReconnectRequired) {
+                                                    closeReaderState(reader.name)
+                                                    (bleService?.reconnectReader(reader.name)
+                                                            ?: reader.openSession()).also {
+                                                        activeSessions[reader.name] = it
+                                                        hardReconnectRequired = false
                                                     }
+                                                } else {
+                                                    activeSessions.getOrPut(reader.name) {
+                                                        reader.openSession()
+                                                    }
+                                                }
+                                            } catch (e: BleCardSettlingException) {
+                                                // A proactive refresh is not a stale GATT
+                                                // failure. Let openSession perform the STATUS
+                                                // probe on the next pass instead of disconnecting
+                                                // the reader again.
+                                                hardReconnectRequired = false
+                                                closeReaderState(reader.name)
+                                                waitForReaderRetry(e, readyDeadline)
+                                                continue@openLoop
+                                            }
 
+                                            var settledDuringSelect = false
                                             for (aid in req.aids) {
                                                 try {
                                                     val aidBytes = hexToBytes(aid)
                                                     Log.d(
                                                             TAG,
-                                                            "Trying to open logical channel for AID: $aid (attempt ${attempt + 1})"
+                                                            "Trying to open logical channel for AID: $aid (pass ${pass + 1})"
                                                     )
-                                                    openedChannel =
-                                                            session.openLogicalChannel(aidBytes)
+                                                    openedChannel = session.openLogicalChannel(aidBytes)
                                                     if (openedChannel != null) {
                                                         matchedAid = aid
                                                         val channelKey = ChannelKey(client, reader.name, aid)
-                                                        activeChannels[channelKey] =
-                                                                openedChannel!!
+                                                        activeChannels[channelKey] = openedChannel!!
                                                         cardAuthorizationStates.put(
                                                                 channelKey,
                                                                 CardAuthorizationState(
                                                                         eid = slotEids[reader.name]
                                                                 )
                                                         )?.challenge?.fill(0)
-                                                        Log.i(
-                                                                TAG,
-                                                                "Successfully opened channel for AID: $aid"
-                                                        )
+                                                        Log.i(TAG, "Successfully opened channel for AID: $aid")
                                                         break
                                                     }
                                                 } catch (e: BleCardSettlingException) {
                                                     Log.i(TAG, e.message ?: "9eSIM is settling")
-                                                    throw e
+                                                    closeReaderState(reader.name)
+                                                    hardReconnectRequired = false
+                                                    settledDuringSelect = true
+                                                    waitForReaderRetry(e, readyDeadline)
+                                                    break
                                                 } catch (e: SecurityException) {
                                                     Log.e(
                                                             TAG,
                                                             "SecurityException opening channel for AID $aid. App might not be whitelisted: ${e.message}"
                                                     )
                                                 } catch (e: Exception) {
-                                                    Log.w(
-                                                            TAG,
-                                                            "Failed for AID $aid: ${e.message}",
-                                                            e
-                                                    )
+                                                    Log.w(TAG, "Failed for AID $aid: ${e.message}", e)
                                                 }
                                             }
+
+                                            if (openedChannel != null) break@openLoop
+                                            if (settledDuringSelect) continue@openLoop
+                                            if (staleRecoveryUsed) break@openLoop
+
+                                            staleRecoveryUsed = true
+                                            hardReconnectRequired = true
+                                            pass += 1
+                                            Log.w(
+                                                    TAG,
+                                                    "All AIDs failed for ${reader.name}; reconnecting BLE and retrying once"
+                                            )
                                         }
 
                                         if (openedChannel != null) {
@@ -1450,6 +1488,17 @@ class RemoService : Service() {
         activeSessions.clear()
         transactionLeases.clear()
         takeoverAttempts.clear()
+    }
+
+    private suspend fun waitForReaderRetry(
+            error: BleCardSettlingException,
+            deadlineMs: Long
+    ) {
+        val remainingMs = deadlineMs - System.currentTimeMillis()
+        val waitMs = error.retryAfterMillis.coerceAtLeast(100L)
+        if (remainingMs <= 0L || waitMs > remainingMs) throw error
+        Log.i(TAG, "Keeping /openChannel pending for $waitMs ms while the BLE reader recovers")
+        kotlinx.coroutines.delay(waitMs)
     }
 
     private fun closeReaderState(readerName: String) {

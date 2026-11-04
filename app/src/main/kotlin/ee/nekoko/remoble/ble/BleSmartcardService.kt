@@ -12,7 +12,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
-import android.util.Log
+import ee.nekoko.remoble.ConsoleLog as Log
 import androidx.core.content.ContextCompat
 import ee.nekoko.remoble.omapi.SmartcardChannel
 import ee.nekoko.remoble.omapi.SmartcardReader
@@ -74,6 +74,9 @@ class BleSmartcardService(
     private val pinStore = BLEPinStore(context)
     private val foundReaders = ConcurrentHashMap<String, BleReader>()
     private val pendingRenamedReaders = ConcurrentHashMap<String, String>()
+    private val settleExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+    private val settleTasks =
+            ConcurrentHashMap<String, java.util.concurrent.ScheduledFuture<*>>()
     @Volatile private var scanning = false
     @Volatile private var closed = false
 
@@ -174,14 +177,24 @@ class BleSmartcardService(
 
     fun setReaderEnabled(readerName: String, enabled: Boolean) {
         val reader = findReader(readerName) ?: return
+        reader.enabledForLocalUse = enabled
         if (enabled) {
-            remember(reader)
+            if (!reader.remembered) remember(reader)
+            if (reader.isSettling()) {
+                scheduleSettleRecovery(reader, reader.settleRetryDelay())
+            }
+        } else {
+            // Closing GATT is essential: many writers stop advertising while a central remains
+            // connected, so another phone cannot discover them until this handle is released.
+            cancelSettleRecovery(reader)
+            reader.disconnect()
         }
         executor.execute { onReadersChanged() }
     }
 
     fun forgetReader(readerName: String) {
         val reader = findReader(readerName) ?: return
+        cancelSettleRecovery(reader)
         reader.disconnect()
         reader.remembered = false
         removeRemembered(reader)
@@ -197,7 +210,10 @@ class BleSmartcardService(
         // On Android 12+, even querying adapter state requires BLUETOOTH_CONNECT.
         if (closed || scanning || !hasPermissions() || adapter?.isEnabled != true) return false
         val scanner = adapter.bluetoothLeScanner ?: return false
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        // This scanner is kept alive by the foreground bridge. Balanced mode remains responsive
+        // enough for remembered readers while avoiding the controller/UI pressure of an
+        // indefinite low-latency scan.
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_BALANCED).build()
         return try {
             scanner.startScan(null, settings, callback)
             scanning = true
@@ -212,6 +228,9 @@ class BleSmartcardService(
         closed = true
         if (scanning && hasPermissions()) runCatching { adapter?.bluetoothLeScanner?.stopScan(callback) }
         scanning = false
+        settleTasks.values.forEach { it.cancel(false) }
+        settleTasks.clear()
+        settleExecutor.shutdownNow()
         foundReaders.values.forEach { it.disconnect() }
         foundReaders.clear()
     }
@@ -222,23 +241,27 @@ class BleSmartcardService(
      * inside APDU transmission: a rejected AID is a valid card response, so only the HTTP
      * open-channel fallback should decide that every candidate AID has failed.
      */
-    fun reconnectReader(readerName: String): SmartcardSession? {
+    suspend fun reconnectReader(readerName: String): SmartcardSession? {
         val reader = findReader(readerName) ?: return null
-        reader.throwIfSettling()
         Log.w(TAG, "Resetting GATT connection for $readerName")
         reader.disconnect()
         // Some Android Bluetooth stacks need a short quiet period after BluetoothGatt.close()
         // before the same peripheral can be connected again.
-        Thread.sleep(500)
+        kotlinx.coroutines.delay(500)
         return reader.openSession()
     }
 
     fun isReaderSettling(readerName: String): Boolean =
             findReader(readerName)?.isSettling() == true
 
-    /** Limits optional PSK discovery to actual 9eSIM advertisements, not every NBLE/TYBLE peer. */
+    /**
+     * Keeps card authorization tied to the BLE transport instead of the mutable display name.
+     * A 9eSIM B0/B1 remains eligible after its name is changed through the management APDU.
+     * The PSK service remains authoritative and may return no key for another compatible peer.
+     */
     fun isNineEsimReader(readerName: String): Boolean =
-            findReader(readerName)?.displayName?.startsWith("9eSIM", ignoreCase = true) == true
+            findReader(readerName)?.type in
+                    setOf(BleProfileFactory.TYPE_NBLE, BleProfileFactory.TYPE_TYBLE)
 
     private fun findReader(readerName: String): BleReader? {
         foundReaders.values.firstOrNull { it.name == readerName }?.let { return it }
@@ -278,6 +301,7 @@ class BleSmartcardService(
             // Migrate a previously remembered six-character/NBLE identity to
             // the live eight-digit B1 advertisement before authenticating.
             val wasRemembered = existing.remembered
+            cancelSettleRecovery(existing)
             existing.disconnect()
             val replacement = BleReader(
                     readerName, displayName, type, result.device, lastRssi = result.rssi
@@ -358,6 +382,52 @@ class BleSmartcardService(
         prefs.edit().putStringSet(PREF_REMEMBERED_READERS, current).apply()
     }
 
+    /**
+     * A proactive REFRESH starts with a mandatory silent period. NekokoLPA2's HTTP timeout is
+     * shorter than that period, so the reader must advance its STATUS probes independently of a
+     * later /openChannel request. Only one recovery task is active per physical reader.
+     */
+    private fun scheduleSettleRecovery(reader: BleReader, delayMs: Long) {
+        val key = reader.device.address.uppercase()
+        if (closed || !reader.enabledForLocalUse || foundReaders[key] !== reader) return
+        val existing = settleTasks[key]
+        if (existing != null && !existing.isDone) return
+
+        val task = settleExecutor.schedule(
+                {
+                    settleTasks.remove(key)
+                    if (closed || !reader.enabledForLocalUse ||
+                            foundReaders[key] !== reader || !reader.isSettling()) {
+                        return@schedule
+                    }
+                    try {
+                        synchronized(reader.lock) { reader.settleNbleIfRequired() }
+                        Log.i(TAG, "Background STATUS recovery completed for ${reader.name}")
+                        executor.execute { onReadersChanged() }
+                    } catch (settling: BleCardSettlingException) {
+                        if (reader.isSettling()) {
+                            scheduleSettleRecovery(
+                                    reader,
+                                    settling.retryAfterMillis.coerceAtLeast(100L)
+                            )
+                        } else {
+                            executor.execute { onReadersChanged() }
+                        }
+                    } catch (error: Exception) {
+                        Log.w(TAG, "Background STATUS recovery failed for ${reader.name}", error)
+                        if (reader.isSettling()) scheduleSettleRecovery(reader, 1_000L)
+                    }
+                },
+                delayMs.coerceAtLeast(100L),
+                java.util.concurrent.TimeUnit.MILLISECONDS
+        )
+        settleTasks[key] = task
+    }
+
+    private fun cancelSettleRecovery(reader: BleReader) {
+        settleTasks.remove(reader.device.address.uppercase())?.cancel(false)
+    }
+
     private fun pinKey(reader: BleReader): String =
             "nble.pin.${reader.device.address.uppercase().replace(":", "")}"
 
@@ -370,9 +440,10 @@ class BleSmartcardService(
             @Volatile var lastRssi: Int? = null
     ) : SmartcardReader {
         @Volatile var lastSeen: Long = System.currentTimeMillis()
+        @Volatile var enabledForLocalUse: Boolean = true
         val lock = Any()
-        var profile: BleProfile? = null
-        private var settleDeadlineMs = 0L
+        @Volatile var profile: BleProfile? = null
+        @Volatile private var settleDeadlineMs = 0L
         private var nextSettleProbeMs = 0L
         private var settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
         private var profileSwitchRefreshPending = false
@@ -390,7 +461,9 @@ class BleSmartcardService(
             return BleSession(this)
         }
 
-        fun isProfileConnected(): Boolean = synchronized(lock) { profile != null }
+        // UI snapshots must never wait for a BLE handshake: connect/discover can block for up to
+        // the GATT timeout and used to freeze scrolling when the screen refreshed.
+        fun isProfileConnected(): Boolean = profile != null
 
         fun connectExplicit(pin: String?) = synchronized(lock) {
             settleNbleIfRequired()
@@ -471,8 +544,11 @@ class BleSmartcardService(
             }
         }
 
-        fun isSettling(): Boolean = synchronized(lock) {
-            type == BleProfileFactory.TYPE_NBLE && settleDeadlineMs != 0L
+        fun isSettling(): Boolean =
+                type == BleProfileFactory.TYPE_NBLE && settleDeadlineMs != 0L
+
+        fun settleRetryDelay(): Long = synchronized(lock) {
+            (nextSettleProbeMs - System.currentTimeMillis()).coerceAtLeast(100L)
         }
 
         fun throwIfSettling() = synchronized(lock) {
@@ -488,6 +564,7 @@ class BleSmartcardService(
                 nextSettleProbeMs = now + NBLE_SETTLE_QUIET_MS
                 settleProbeGapMs = NBLE_SETTLE_INITIAL_PROBE_GAP_MS
                 Log.i(TAG, "Releasing ${name} for the handset's proactive REFRESH")
+                scheduleSettleRecovery(this, NBLE_SETTLE_QUIET_MS)
             }
             runCatching { active.close() }
             if (profile === active) profile = null
@@ -506,7 +583,11 @@ class BleSmartcardService(
             var probeProfile: BleProfile? = null
             try {
                 probeProfile = connectProfile()
-                val response = probeProfile.transmit(NBLE_STATUS_APDU)
+                // Match NekokoLPA2's control-APDU flow. 9eSIM commonly answers the first
+                // STATUS with 6C39; that is a request to resend with Le=39, not a signal that
+                // the modem is still uninitialised. Treating 6C39 as a terminal response kept
+                // the reader in Recovering until every deadline expired.
+                val response = transmitControl(probeProfile, NBLE_STATUS_APDU)
                 if (BleProtocolCodec.nbleCardState(response) == BleProtocolCodec.NbleCardState.READY) {
                     Log.i(TAG, "9eSIM ${name} reported idle after profile switch")
                     settleDeadlineMs = 0L
@@ -532,6 +613,35 @@ class BleSmartcardService(
                 settleProbeGapMs = (settleProbeGapMs * 2).coerceAtMost(NBLE_SETTLE_MAX_PROBE_GAP_MS)
             }
             throw settlingException()
+        }
+
+        /** Reassembles ISO 7816 response correction/chaining for the recovery STATUS probe. */
+        private fun transmitControl(active: BleProfile, command: ByteArray): ByteArray {
+            var current = command.copyOf()
+            val output = java.io.ByteArrayOutputStream()
+            repeat(8) {
+                val response = active.transmit(current)
+                require(response.size >= 2) { "Truncated STATUS response" }
+                val sw1 = response[response.size - 2].toInt() and 0xff
+                val sw2 = response.last().toInt() and 0xff
+                when (sw1) {
+                    0x61, 0x9f -> {
+                        output.write(response, 0, response.size - 2)
+                        current = byteArrayOf(current[0], 0xc0.toByte(), 0x00, 0x00, sw2.toByte())
+                    }
+                    0x6c -> {
+                        require(current.isNotEmpty()) { "Invalid STATUS correction" }
+                        current = current.copyOf().also { corrected ->
+                            corrected[corrected.lastIndex] = sw2.toByte()
+                        }
+                    }
+                    else -> {
+                        output.write(response)
+                        return output.toByteArray()
+                    }
+                }
+            }
+            error("STATUS response did not finish reassembling")
         }
 
         private fun settlingException(now: Long = System.currentTimeMillis()): BleCardSettlingException =

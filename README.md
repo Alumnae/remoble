@@ -38,10 +38,6 @@ and asks for the Nearby devices permissions (`BLUETOOTH_SCAN` and `BLUETOOTH_CON
 Android 12+, or location permission on older Android versions. It does not access the phone's
 internal eUICC, OMAPI or Telephony APIs.
 
-If by “USB interno” you mean the phone's built-in Bluetooth controller, Android exposes it via
-the Bluetooth framework rather than as a USB device. An app cannot and does not need to claim
-that internal controller through `UsbManager`. External USB readers are a separate transport.
-
 ## iOS
 
 The native Swift target is in [`ios/Remoble.xcodeproj`](ios/Remoble.xcodeproj). It uses

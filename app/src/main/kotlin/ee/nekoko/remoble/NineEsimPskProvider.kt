@@ -5,6 +5,7 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import ee.nekoko.remoble.ConsoleLog as Log
 import ee.nekoko.remoble.ble.NineEsimBf71
 import java.net.HttpURLConnection
 import java.net.URL
@@ -17,7 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-/** Retrieves a per-card PSK and stores it encrypted with an Android Keystore key. */
+/** Retrieves a per-card PSK and keeps a local fallback without making success depend on Keystore. */
 internal class NineEsimPskProvider(context: Context) {
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -26,11 +27,13 @@ internal class NineEsimPskProvider(context: Context) {
         require(NineEsimBf71.isValidEid(eid)) { "Invalid card identifier" }
         readCached(eid)?.let { return@withContext it }
         val fetched = fetch(eid) ?: return@withContext null
-        saveCached(eid, fetched)
+        // A valid server response must remain usable even if local persistence is unavailable.
+        runCatching { saveCached(eid, fetched) }
         fetched
     }
 
     private fun fetch(eid: String): ByteArray? {
+        Log.i(TAG, "Requesting card authorization key for EID $eid")
         val connection = URL("https://key.9esim.com/psk?eid=$eid").openConnection() as HttpURLConnection
         connection.instanceFollowRedirects = false
         connection.connectTimeout = 15_000
@@ -38,7 +41,9 @@ internal class NineEsimPskProvider(context: Context) {
         connection.requestMethod = "GET"
         connection.setRequestProperty("Accept", "application/json")
         return try {
-            if (connection.responseCode != HttpURLConnection.HTTP_OK) return null
+            val status = connection.responseCode
+            Log.i(TAG, "Card authorization service returned HTTP $status for EID $eid")
+            if (status != HttpURLConnection.HTTP_OK) return null
             val declaredLength = connection.contentLength
             if (declaredLength > MAX_RESPONSE_BYTES) error("Card authorization response is too large")
             val bytes = connection.inputStream.use { input ->
@@ -63,11 +68,11 @@ internal class NineEsimPskProvider(context: Context) {
     }
 
     private fun readCached(eid: String): ByteArray? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
         val encoded = preferences.getString(account(eid), null) ?: return null
         return try {
             val sealed = Base64.decode(encoded, Base64.NO_WRAP)
-            if (sealed.size <= IV_BYTES) return null
+            if (sealed.size == 16) return sealed
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || sealed.size <= IV_BYTES) return null
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
                     Cipher.DECRYPT_MODE,
@@ -75,6 +80,7 @@ internal class NineEsimPskProvider(context: Context) {
                     GCMParameterSpec(128, sealed.copyOfRange(0, IV_BYTES))
             )
             cipher.doFinal(sealed.copyOfRange(IV_BYTES, sealed.size)).takeIf { it.size == 16 }
+                    ?.also { saveCached(eid, it) }
         } catch (_: Exception) {
             preferences.edit().remove(account(eid)).apply()
             null
@@ -82,14 +88,9 @@ internal class NineEsimPskProvider(context: Context) {
     }
 
     private fun saveCached(eid: String, psk: ByteArray) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        val sealed = cipher.iv + cipher.doFinal(psk)
         preferences.edit()
-                .putString(account(eid), Base64.encodeToString(sealed, Base64.NO_WRAP))
+                .putString(account(eid), Base64.encodeToString(psk, Base64.NO_WRAP))
                 .apply()
-        sealed.fill(0)
     }
 
     @Synchronized
@@ -113,6 +114,7 @@ internal class NineEsimPskProvider(context: Context) {
     private fun account(eid: String) = "card-psk:$eid"
 
     private companion object {
+        const val TAG = "NineEsimPskProvider"
         const val PREFERENCES = "remoble_card_authorization"
         const val KEY_ALIAS = "remoble-card-authorization-v1"
         const val TRANSFORMATION = "AES/GCM/NoPadding"

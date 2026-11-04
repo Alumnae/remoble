@@ -37,6 +37,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     @Published private(set) var readers: [BLEReader] = []
     @Published private(set) var connectedReaderIDs = Set<UUID>()
     @Published private(set) var connectingReaderIDs = Set<UUID>()
+    @Published private(set) var pendingEnableReaderIDs = Set<UUID>()
     @Published private(set) var enabledReaderIDs = Set<UUID>()
     @Published private(set) var selectedReader: BLEReader?
     @Published private(set) var readerRSSI: [UUID: Int] = [:]
@@ -45,11 +46,14 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     @Published private(set) var connectionStatus = "Disconnected"
     @Published private(set) var lastError: String?
     @Published private(set) var serverRunning = false
+    @Published private(set) var serverTransitioning = false
+    @Published private(set) var serverTransitionTarget: Bool?
     @Published private(set) var serverStatus = "Stopped"
     @Published private(set) var serverURL = "http://device-address:33777"
     @Published private(set) var httpPort: UInt16 = 33777
     @Published private(set) var minimumRSSI = -88
     @Published private(set) var httpPasswordConfigured = false
+    @Published private(set) var ensureSingleChannel = true
 
     private lazy var central = CBCentralManager(delegate: self, queue: .main, options: [
         CBCentralManagerOptionRestoreIdentifierKey: "ee.nekoko.remoble.central",
@@ -83,6 +87,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     private static let httpPortKey = "http.listener.port"
     private static let defaultHTTPPort: UInt16 = 33777
     private static let minimumRSSIKey = "ble.minimum.rssi"
+    private static let ensureSingleChannelKey = "http.ensure.single.channel"
 
     override init() {
         super.init()
@@ -96,6 +101,9 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
         if defaults.object(forKey: Self.minimumRSSIKey) != nil {
             minimumRSSI = min(-50, max(-120, defaults.integer(forKey: Self.minimumRSSIKey)))
         }
+        if defaults.object(forKey: Self.ensureSingleChannelKey) != nil {
+            ensureSingleChannel = defaults.bool(forKey: Self.ensureSingleChannelKey)
+        }
         httpPasswordValue = HTTPPasswordStore.load() ?? ""
         httpPasswordConfigured = !httpPasswordValue.isEmpty
         _ = central
@@ -105,12 +113,18 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     var connectedReaders: [BLEReader] { readers.filter { connectedReaderIDs.contains($0.id) } }
     func isConnected(_ reader: BLEReader) -> Bool { connectedReaderIDs.contains(reader.id) }
     func isConnecting(_ reader: BLEReader) -> Bool { connectingReaderIDs.contains(reader.id) }
+    func isEnabling(_ reader: BLEReader) -> Bool { pendingEnableReaderIDs.contains(reader.id) }
     func isReaderEnabled(_ reader: BLEReader) -> Bool { enabledReaderIDs.contains(reader.id) }
     func rssi(for reader: BLEReader) -> Int? { readerRSSI[reader.id] }
 
     func setMinimumRSSI(_ value: Int) {
         minimumRSSI = min(-50, max(-120, value))
         defaults.set(minimumRSSI, forKey: Self.minimumRSSIKey)
+    }
+
+    func setEnsureSingleChannel(_ enabled: Bool) {
+        ensureSingleChannel = enabled
+        defaults.set(enabled, forKey: Self.ensureSingleChannelKey)
     }
 
     func eid(for reader: BLEReader) -> String? {
@@ -143,6 +157,15 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
             enabledReaderIDs.remove(reader.id)
             openChannelRecoveryCooldowns.removeValue(forKey: reader.id)
             disconnect(reader)
+            // CoreBluetooth cancellation is asynchronous. Retry once if the peripheral still
+            // owns a connection, but only while the checkbox remains off; this releases writers
+            // that suppress advertising while connected so another phone can discover them.
+            Task { @MainActor [weak self] in
+                try? await Task<Never, Never>.sleep(nanoseconds: 500_000_000)
+                guard let self, !self.enabledReaderIDs.contains(reader.id),
+                      reader.peripheral.state != .disconnected else { return }
+                self.central.cancelPeripheralConnection(reader.peripheral)
+            }
         }
         defaults.set(enabledReaderIDs.map(\.uuidString).sorted(), forKey: Self.enabledReadersKey)
     }
@@ -215,6 +238,40 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
             }
             connectionStatus = "Connection failed: \(reader.name)"
             lastError = error.localizedDescription
+        }
+    }
+
+    /// Authenticates a locally selected reader before making it visible to the HTTP bridge.
+    /// Pending readers can connect locally, but /listSlots continues to use enabledReaderIDs.
+    func enableReaderAfterConnection(_ reader: BLEReader, pin: String, forceReconnect: Bool = false) async {
+        selectedReader = reader
+        lastError = nil
+        if enabledReaderIDs.contains(reader.id) {
+            if forceReconnect {
+                await reconnect(reader, pin: pin)
+            } else {
+                await connect(reader, pin: pin)
+            }
+            return
+        }
+        guard pendingEnableReaderIDs.insert(reader.id).inserted else { return }
+        manuallyDisconnectedIDs.remove(reader.id)
+        defer { pendingEnableReaderIDs.remove(reader.id) }
+        do {
+            try await connectThrowing(reader, pin: pin)
+            guard pendingEnableReaderIDs.contains(reader.id) else {
+                disconnect(reader)
+                return
+            }
+            setReaderEnabled(reader, enabled: true)
+        } catch {
+            disconnect(reader)
+            if isAuthenticationError(error) {
+                handleAuthenticationFailure(error, for: reader)
+            } else {
+                connectionStatus = "Connection failed: \(reader.name)"
+                lastError = error.localizedDescription
+            }
         }
     }
 
@@ -328,6 +385,10 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
             attempt += 1
             do {
                 try await establish(session); try await session.prepare(pin: pin)
+                // The checkbox may have been cleared while discovery/authentication was in
+                // flight. Never publish or retain that late connection after local ownership was
+                // explicitly released.
+                try ensureConnectionAllowed(for: reader)
                 connectedReaderIDs.insert(reader.id)
                 recoveringReaderIDs.remove(reader.id)
                 connectionStatus = "\(connectedReaderIDs.count) BLE card connected"
@@ -361,7 +422,7 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
     }
 
     private func ensureConnectionAllowed(for reader: BLEReader) throws {
-        guard enabledReaderIDs.contains(reader.id) else {
+        guard enabledReaderIDs.contains(reader.id) || pendingEnableReaderIDs.contains(reader.id) else {
             throw RemobleError.message("BLE reader disabled")
         }
         guard !manuallyDisconnectedIDs.contains(reader.id) else {
@@ -532,6 +593,21 @@ final class RemobleBridge: NSObject, ObservableObject, @preconcurrency CBCentral
         } catch { serverStatus = "Failed: \(error.localizedDescription)"; lastError = error.localizedDescription }
     }
     func stopServer() { server.stop(); serverRunning = false; serverStatus = "Stopped" }
+
+    func toggleServer() {
+        guard !serverTransitioning else { return }
+        let target = !serverRunning
+        serverTransitioning = true
+        serverTransitionTarget = target
+        if target { startServer() } else { stopServer() }
+        Task { @MainActor [weak self] in
+            // Absorb double taps delivered while SwiftUI is publishing the new listener state.
+            try? await Task<Never, Never>.sleep(nanoseconds: 1_000_000_000)
+            guard let self, self.serverTransitionTarget == target else { return }
+            self.serverTransitioning = false
+            self.serverTransitionTarget = nil
+        }
+    }
 
     func attachAudio(_ audio: BackgroundAudioKeeper) {
         audioController = audio

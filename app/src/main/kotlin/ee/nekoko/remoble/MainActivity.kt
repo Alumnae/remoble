@@ -15,16 +15,19 @@ import android.text.method.PasswordTransformationMethod
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import ee.nekoko.remoble.ble.BleProfileFactory
 import ee.nekoko.remoble.ble.BleReaderSnapshot
@@ -50,6 +53,9 @@ class MainActivity : AppCompatActivity() {
     private var smartcardService: BleSmartcardService? = null
     private var ownsSmartcardService = false
     private var pendingServiceStart = false
+    private var bridgeTransitionInProgress = false
+    private var bridgeTransitionTargetRunning = false
+    private var bridgeTransitionGeneration = 0
     private val passwordStore by lazy { HTTPPasswordStore(this) }
 
     private lateinit var content: LinearLayout
@@ -65,6 +71,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var autoStartCheckbox: CheckBox
     private lateinit var readersContainer: LinearLayout
     private lateinit var clientsContainer: LinearLayout
+    private lateinit var consolePanel: LinearLayout
+    private lateinit var consoleScroll: ScrollView
+    private lateinit var consoleText: TextView
+    private lateinit var consoleSwitch: SwitchCompat
+    private var renderedReadersKey: String? = null
+    private var renderedConsoleVersion = -1L
+    private val connectingReaderNames = mutableSetOf<String>()
 
     private val uiRefreshTask = object : Runnable {
         override fun run() {
@@ -76,12 +89,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val consoleRefreshTask = object : Runnable {
+        override fun run() {
+            refreshConsole()
+            uiHandler.postDelayed(this, 500)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildInterface()
         requestBlePermissions(startServiceWhenGranted = false)
         ensureScanner()
         uiHandler.post(uiRefreshTask)
+        uiHandler.post(consoleRefreshTask)
 
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.getBoolean("auto_start", true)) {
@@ -92,18 +113,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildInterface() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val root = ScrollView(this).apply {
-            isFillViewport = true
+        val screen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             background = GradientDrawable(
                     GradientDrawable.Orientation.TL_BR,
                     intArrayOf(Color.parseColor("#171C33"), Color.parseColor(COLOR_BACKGROUND))
             )
+        }
+        val root = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(Color.TRANSPARENT)
         }
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(28), dp(20), dp(48))
         }
         root.addView(content)
+        screen.addView(
+                root,
+                LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                )
+        )
 
         content.addView(TextView(this).apply {
             text = "REMOBLE"
@@ -126,10 +159,7 @@ class MainActivity : AppCompatActivity() {
             addView(statusText)
             addView(urlText)
             actionButton = primaryButton("Start bridge") {
-                if (RemoService.isRunning) stopRemoService() else {
-                    saveGeneralSettings()
-                    startRemoService()
-                }
+                requestBridgeState(!RemoService.isRunning)
             }
             addView(actionButton, matchParams(top = 18))
         }
@@ -214,7 +244,7 @@ class MainActivity : AppCompatActivity() {
         sectionTitle("Operation")
         val operationCard = card()
         singleChannelCheckbox = checkbox(
-                "Restrict to a single logical channel",
+                "Ensure one logical channel",
                 prefs.getBoolean("single_channel", true)
         ) { saveGeneralSettings() }
         autoStartCheckbox = checkbox(
@@ -223,6 +253,7 @@ class MainActivity : AppCompatActivity() {
         ) { saveGeneralSettings() }
         operationCard.addView(singleChannelCheckbox)
         operationCard.addView(autoStartCheckbox)
+        operationCard.addView(caption("When enabled, a new request from the same remote client closes its previous channel on that card. Other clients and the Bluetooth pairing are not interrupted."))
         operationCard.addView(caption("The foreground service and partial wake lock keep HTTP and Bluetooth available while the screen is off."))
         content.addView(operationCard)
 
@@ -243,18 +274,42 @@ class MainActivity : AppCompatActivity() {
 
         sectionTitle("Diagnostics")
         val diagnostics = card()
+        consoleSwitch = SwitchCompat(this).apply {
+            text = "Console log"
+            isChecked = prefs.getBoolean("console_enabled", false)
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(4), 0, dp(8))
+            setOnCheckedChangeListener { _, enabled ->
+                prefs.edit().putBoolean("console_enabled", enabled).apply()
+                setConsoleVisible(enabled)
+            }
+        }
+        diagnostics.addView(consoleSwitch)
+        diagnostics.addView(caption("Shows a bounded in-memory diagnostic log. Drag the console handle to resize it."))
         clientsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        diagnostics.addView(divider().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
+        })
         diagnostics.addView(clientsContainer)
         diagnostics.addView(caption("Compatible clients seen during the last ten minutes."), matchParams(top = 8))
         content.addView(diagnostics)
 
         sectionTitle("About")
         content.addView(card().apply {
-            addView(valueText("Remoble 0.6.0", 16f))
+            addView(valueText("Remoble 0.6.9", 16f))
             addView(caption("Android 5.0+ · Bluetooth Low Energy · foreground background operation"))
         })
 
-        setContentView(root)
+        consolePanel = buildConsolePanel()
+        screen.addView(
+                consolePanel,
+                LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        (resources.displayMetrics.heightPixels * 0.30f).roundToInt()
+                )
+        )
+        setContentView(screen)
+        setConsoleVisible(consoleSwitch.isChecked)
         updatePasswordStatus()
     }
 
@@ -264,20 +319,106 @@ class MainActivity : AppCompatActivity() {
         val port = RemoService.listeningPort.takeIf { it > 0 }
                 ?: prefs.getInt("port", RemoService.DEFAULT_PORT)
         val addresses = ipAddresses()
-        statusText.text = if (running) "Bridge online" else "Bridge offline"
-        statusText.setTextColor(Color.parseColor(if (running) "#62D98B" else "#AAB4C8"))
+        statusText.text = if (bridgeTransitionInProgress) {
+            if (bridgeTransitionTargetRunning) "Starting bridge…" else "Stopping bridge…"
+        } else if (running) "Bridge online" else "Bridge offline"
+        statusText.setTextColor(Color.parseColor(
+                if (bridgeTransitionInProgress) "#FFB74D"
+                else if (running) "#62D98B" else "#AAB4C8"
+        ))
         urlText.text = if (running) {
             val address = addresses.firstOrNull() ?: "0.0.0.0"
             "http://$address:$port${RemoService.serverStatusMessage?.let { "\n$it" }.orEmpty()}"
         } else "Start the bridge to accept remote connections"
-        actionButton.text = if (running) "Stop bridge" else "Start bridge"
+        actionButton.text = if (bridgeTransitionInProgress) {
+            if (bridgeTransitionTargetRunning) "Starting…" else "Stopping…"
+        } else if (running) "Stop bridge" else "Start bridge"
+        actionButton.isEnabled = !bridgeTransitionInProgress
+        actionButton.alpha = if (bridgeTransitionInProgress) 0.62f else 1f
         updatePasswordStatus()
+    }
+
+    private fun requestBridgeState(targetRunning: Boolean) {
+        if (bridgeTransitionInProgress ||
+                (RemoService.isRunning == targetRunning &&
+                        (!targetRunning || RemoService.listeningPort > 0))) return
+
+        bridgeTransitionInProgress = true
+        bridgeTransitionTargetRunning = targetRunning
+        val generation = ++bridgeTransitionGeneration
+        updateServerUi()
+
+        val accepted = if (targetRunning) {
+            saveGeneralSettings()
+            startRemoService()
+        } else {
+            stopRemoService()
+            true
+        }
+        if (!accepted) {
+            finishBridgeTransition(generation)
+            return
+        }
+        awaitBridgeState(targetRunning, generation, System.currentTimeMillis() + 12_000L)
+    }
+
+    private fun awaitBridgeState(targetRunning: Boolean, generation: Int, deadline: Long) {
+        if (generation != bridgeTransitionGeneration) return
+        val reached = if (targetRunning) {
+            RemoService.isRunning && RemoService.listeningPort > 0
+        } else {
+            !RemoService.isRunning
+        }
+        if (reached) {
+            finishBridgeTransition(generation)
+        } else if (System.currentTimeMillis() >= deadline) {
+            finishBridgeTransition(generation)
+            Toast.makeText(
+                    this,
+                    RemoService.serverStatusMessage ?: "Bridge transition timed out",
+                    Toast.LENGTH_LONG
+            ).show()
+        } else {
+            uiHandler.postDelayed(
+                    { awaitBridgeState(targetRunning, generation, deadline) },
+                    200
+            )
+        }
+    }
+
+    private fun finishBridgeTransition(generation: Int) {
+        if (generation != bridgeTransitionGeneration) return
+        bridgeTransitionInProgress = false
+        updateServerUi()
     }
 
     private fun refreshReaders() {
         if (!::readersContainer.isInitialized) return
-        val backend = smartcardService ?: return
+        val backend = smartcardService ?: run {
+            renderedReadersKey = null
+            readersContainer.removeAllViews()
+            return
+        }
         val snapshots = backend.readerSnapshots()
+        // Recreating every row every two seconds interrupts ScrollView gestures, and the old
+        // snapshot implementation could wait on an in-progress BLE handshake. Render only when
+        // a reader's identity or usable state changes; RSSI stays available to the server's
+        // transaction preflight without forcing an expensive UI rebuild.
+        val renderKey = snapshots.joinToString("|") { reader ->
+            listOf(
+                    reader.readerName,
+                    reader.displayName,
+                    reader.type,
+                    reader.address,
+                    reader.remembered,
+                    reader.connected,
+                    reader.settling,
+                    connectingReaderNames.contains(reader.readerName),
+                    isReaderVisible(reader)
+            ).joinToString(";")
+        }
+        if (renderKey == renderedReadersKey) return
+        renderedReadersKey = renderKey
         readersContainer.removeAllViews()
         if (snapshots.isEmpty()) {
             readersContainer.addView(caption("No compatible Bluetooth card found"))
@@ -290,6 +431,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun readerView(reader: BleReaderSnapshot): View {
+        val connecting = connectingReaderNames.contains(reader.readerName)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, dp(8))
@@ -299,9 +441,18 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val enabled = checkbox("", isReaderVisible(reader)) { checked ->
-            smartcardService?.setReaderEnabled(reader.readerName, checked)
-            updateAllowedReader(reader, checked)
-        }.apply { setPadding(0, 0, 0, 0) }
+            if (checked) {
+                connectReader(reader, null)
+            } else {
+                smartcardService?.setReaderEnabled(reader.readerName, false)
+                updateAllowedReader(reader, false)
+                renderedReadersKey = null
+                refreshReaders()
+            }
+        }.apply {
+            setPadding(0, 0, 0, 0)
+            isEnabled = !connecting
+        }
         top.addView(enabled, LinearLayout.LayoutParams(dp(48), dp(48)))
         val identity = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -315,12 +466,13 @@ class MainActivity : AppCompatActivity() {
         top.addView(identity, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         val state = when {
             reader.connected -> "Connected"
+            connecting -> "Connecting"
             reader.settling -> "Recovering"
             else -> "Ready"
         }
         top.addView(valueText(state, 13f).apply {
             gravity = Gravity.END
-            setTextColor(Color.parseColor(if (reader.connected) "#62D98B" else if (reader.settling) "#FFB74D" else "#AAB4C8"))
+            setTextColor(Color.parseColor(if (reader.connected) "#62D98B" else if (connecting || reader.settling) "#FFB74D" else "#AAB4C8"))
         })
         row.addView(top)
 
@@ -343,38 +495,184 @@ class MainActivity : AppCompatActivity() {
             }, matchParams(top = 6))
         }
 
-        var downX = 0f
-        row.setOnTouchListener { _, event ->
+        return SwipeDeleteLayout(row) { swipe -> confirmForgetReader(reader, swipe) }
+    }
+
+    private fun confirmForgetReader(reader: BleReaderSnapshot, swipe: SwipeDeleteLayout) {
+        swipe.revealForConfirmation()
+        val dialog = AlertDialog.Builder(this)
+                .setTitle("Remove Bluetooth card?")
+                .setMessage("${reader.displayName}\n${reader.address}\n\nThe saved PIN and remote visibility setting will be removed.")
+                .setNegativeButton("Cancel") { _, _ -> swipe.reset() }
+                .setPositiveButton("Remove") { _, _ ->
+                    swipe.dismissLeft {
+                        smartcardService?.forgetReader(reader.readerName)
+                        removeAllowedReader(reader)
+                        renderedReadersKey = null
+                        refreshReaders()
+                        Toast.makeText(this, "Bluetooth card removed", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                .create()
+        dialog.setOnCancelListener { swipe.reset() }
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setTextColor(Color.parseColor("#FF5252"))
+    }
+
+    /**
+     * iOS-style swipe action: the foreground row tracks a left drag and reveals a persistent red
+     * removal action underneath. Vertical gestures remain owned by the surrounding ScrollView,
+     * and child controls keep receiving ordinary taps.
+     */
+    private inner class SwipeDeleteLayout(
+            private val foreground: View,
+            private val onDeleteRequested: (SwipeDeleteLayout) -> Unit
+    ) : FrameLayout(this@MainActivity) {
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        private var downX = 0f
+        private var downY = 0f
+        private var dragging = false
+
+        init {
+            clipChildren = true
+            clipToPadding = true
+            background = rounded("#B3261E", 12)
+            contentDescription = "Swipe left to remove"
+
+            val removeLabel = TextView(context).apply {
+                text = "Remove"
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setPadding(dp(22), 0, dp(22), 0)
+                setCompoundDrawablesWithIntrinsicBounds(
+                        android.R.drawable.ic_menu_delete,
+                        0,
+                        0,
+                        0
+                )
+                compoundDrawablePadding = dp(8)
+            }
+            addView(
+                    removeLabel,
+                    FrameLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            Gravity.END
+                    )
+            )
+
+            foreground.background = rounded(COLOR_CARD, 12)
+            addView(
+                    foreground,
+                    FrameLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+            )
+        }
+
+        override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    false
+                    downX = event.x
+                    downY = event.y
+                    dragging = false
+                    foreground.animate().cancel()
                 }
-                MotionEvent.ACTION_UP -> if (event.rawX - downX < -dp(90)) {
-                    smartcardService?.forgetReader(reader.readerName)
-                    removeAllowedReader(reader)
-                    Toast.makeText(this, "Card forgotten", Toast.LENGTH_SHORT).show()
-                    refreshReaders()
-                    true
-                } else false
-                else -> false
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (!dragging && dx < -touchSlop &&
+                            kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
+                        dragging = true
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                        return true
+                    }
+                }
             }
+            return dragging
         }
-        return row
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (dragging) {
+                        foreground.translationX =
+                                (event.x - downX).coerceIn(-width.toFloat(), 0f)
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    val shouldConfirm = dragging &&
+                            foreground.translationX <= -minOf(dp(72).toFloat(), width * 0.25f)
+                    dragging = false
+                    if (shouldConfirm) onDeleteRequested(this) else reset()
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    dragging = false
+                    reset()
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+
+        fun revealForConfirmation() {
+            foreground.animate()
+                    .translationX(-dp(104).toFloat())
+                    .setDuration(180)
+                    .start()
+        }
+
+        fun reset() {
+            foreground.animate()
+                    .translationX(0f)
+                    .alpha(1f)
+                    .setDuration(200)
+                    .start()
+        }
+
+        fun dismissLeft(onFinished: () -> Unit) {
+            foreground.animate()
+                    .translationX(-width.toFloat())
+                    .alpha(0.35f)
+                    .setDuration(220)
+                    .withEndAction(onFinished)
+                    .start()
+        }
     }
 
     private fun connectReader(reader: BleReaderSnapshot, pin: String?) {
-        smartcardService?.setReaderEnabled(reader.readerName, true)
-        updateAllowedReader(reader, true)
+        if (!connectingReaderNames.add(reader.readerName)) return
+        renderedReadersKey = null
+        refreshReaders()
         Toast.makeText(this, "Connecting to ${reader.displayName}", Toast.LENGTH_SHORT).show()
         worker.execute {
             val result = runCatching { smartcardService?.connectReader(reader.readerName, pin) }
             runOnUiThread {
                 if (result.isSuccess && result.getOrNull() != null) {
+                    // Publish to /listSlots only after GATT and authentication succeeded.
+                    smartcardService?.setReaderEnabled(reader.readerName, true)
+                    updateAllowedReader(reader, true)
                     Toast.makeText(this, "Connected", Toast.LENGTH_SHORT).show()
                 } else {
+                    smartcardService?.setReaderEnabled(reader.readerName, false)
+                    updateAllowedReader(reader, false)
                     Toast.makeText(this, result.exceptionOrNull()?.message ?: "Connection failed", Toast.LENGTH_LONG).show()
                 }
+                connectingReaderNames.remove(reader.readerName)
+                renderedReadersKey = null
                 refreshReaders()
             }
         }
@@ -653,6 +951,112 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun buildConsolePanel(): LinearLayout {
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#080A10"))
+            elevation = dp(12).toFloat()
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), 0, dp(8), 0)
+            setBackgroundColor(Color.parseColor("#171B25"))
+        }
+        val handle = TextView(this).apply {
+            text = "━━━   CONSOLE"
+            textSize = 11f
+            letterSpacing = 0.08f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(Color.parseColor("#AAB4C8"))
+        }
+        header.addView(handle, LinearLayout.LayoutParams(0, dp(40), 1f))
+        header.addView(secondaryButton("Clear") {
+            ConsoleLog.clear()
+            renderedConsoleVersion = -1
+            refreshConsole(force = true)
+        }, LinearLayout.LayoutParams(dp(76), dp(34)))
+        panel.addView(
+                header,
+                LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(42)
+                )
+        )
+
+        consoleText = TextView(this).apply {
+            textSize = 10.5f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.parseColor("#D4E2FF"))
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(8), dp(12), dp(14))
+        }
+        consoleScroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(
+                    consoleText,
+                    FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.WRAP_CONTENT
+                    )
+            )
+        }
+        panel.addView(
+                consoleScroll,
+                LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                )
+        )
+
+        var dragStartY = 0f
+        var dragStartHeight = 0
+        handle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragStartY = event.rawY
+                    dragStartHeight = panel.height
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val screenHeight = resources.displayMetrics.heightPixels
+                    val minHeight = maxOf(dp(120), (screenHeight * 0.15f).roundToInt())
+                    val maxHeight = (screenHeight * 0.75f).roundToInt()
+                    val requested = dragStartHeight + (dragStartY - event.rawY).roundToInt()
+                    panel.layoutParams = panel.layoutParams.apply {
+                        height = requested.coerceIn(minHeight, maxHeight)
+                    }
+                    true
+                }
+                else -> true
+            }
+        }
+        return panel
+    }
+
+    private fun setConsoleVisible(visible: Boolean) {
+        if (!::consolePanel.isInitialized) return
+        consolePanel.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible) {
+            renderedConsoleVersion = -1
+            refreshConsole(force = true)
+        }
+    }
+
+    private fun refreshConsole(force: Boolean = false) {
+        if (!::consolePanel.isInitialized || consolePanel.visibility != View.VISIBLE) return
+        val version = ConsoleLog.version
+        if (!force && version == renderedConsoleVersion) return
+        val wasNearBottom = !::consoleScroll.isInitialized ||
+                consoleScroll.scrollY + consoleScroll.height >= consoleText.height - dp(36)
+        consoleText.text = ConsoleLog.snapshot().ifEmpty { "No diagnostic events yet." }
+        renderedConsoleVersion = version
+        if (wasNearBottom) consoleScroll.post { consoleScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.action == MotionEvent.ACTION_DOWN) {
             val focused = currentFocus
@@ -670,7 +1074,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        bridgeTransitionGeneration += 1
         uiHandler.removeCallbacks(uiRefreshTask)
+        uiHandler.removeCallbacks(consoleRefreshTask)
         if (ownsSmartcardService) smartcardService?.shutdown()
         worker.shutdownNow()
         super.onDestroy()

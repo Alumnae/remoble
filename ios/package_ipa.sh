@@ -19,7 +19,7 @@ fi
 
 next_number=$((current_number + 1))
 output_dir="$project_dir/build"
-output_path="$output_dir/Remoble-0.6.1-ios-${next_number}.ipa"
+output_path="$output_dir/Remoble-0.6.9-ios-${next_number}.ipa"
 if [[ -e "$output_path" ]]; then
   print -u2 "Refusing to overwrite existing IPA: $output_path"
   exit 1
@@ -28,6 +28,8 @@ fi
 package_dir="$(mktemp -d /private/tmp/remoble-ipa.XXXXXX)"
 mkdir -p "$package_dir/Payload" "$output_dir"
 ditto "$app_path" "$package_dir/Payload/Remoble.app"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $next_number" \
+  "$package_dir/Payload/Remoble.app/Info.plist"
 (
   cd "$package_dir"
   COPYFILE_DISABLE=1 zip -qry "$output_path" Payload

@@ -21,7 +21,6 @@
 		A00000000000000000000012 /* NineEsimCardAuthenticator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* NineEsimCardAuthenticator.swift */; };
 		A00000000000000000000013 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* Assets.xcassets */; };
 		A00000000000000000000014 /* BLEPinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000016 /* BLEPinStore.swift */; };
-		A00000000000000000000015 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000017 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,7 +40,6 @@
 		B00000000000000000000014 /* NineEsimCardAuthenticator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NineEsimCardAuthenticator.swift; sourceTree = "<group>"; };
 		B00000000000000000000015 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B00000000000000000000016 /* BLEPinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEPinStore.swift; sourceTree = "<group>"; };
-		B00000000000000000000017 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -79,7 +77,6 @@
 				B00000000000000000000014 /* NineEsimCardAuthenticator.swift */,
 				B00000000000000000000015 /* Assets.xcassets */,
 				B00000000000000000000016 /* BLEPinStore.swift */,
-				B00000000000000000000017 /* PrivacyInfo.xcprivacy */,
 				B00000000000000000000006 /* RemoHTTPServer.swift */,
 				B00000000000000000000007 /* Info.plist */,
 			);
@@ -153,7 +150,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000013 /* Assets.xcassets in Resources */,
-				A00000000000000000000015 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -210,11 +206,11 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 48;
 				DEVELOPMENT_TEAM = V7ZP3EHBL7;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Remoble/Info.plist;
-				MARKETING_VERSION = 0.6.1;
+				MARKETING_VERSION = 0.6.9;
 				PRODUCT_BUNDLE_IDENTIFIER = ee.nekoko.remoble.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = iphoneos;
@@ -229,11 +225,11 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 48;
 				DEVELOPMENT_TEAM = V7ZP3EHBL7;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Remoble/Info.plist;
-				MARKETING_VERSION = 0.6.1;
+				MARKETING_VERSION = 0.6.9;
 				PRODUCT_BUNDLE_IDENTIFIER = ee.nekoko.remoble.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = iphoneos;

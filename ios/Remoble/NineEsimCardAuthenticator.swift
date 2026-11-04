@@ -34,10 +34,15 @@ final class NineEsimCardAuthenticator {
     /// B1 identifiers are not covered by the supplied B0 range.  For a real
     /// 9eSIM reader we may still ask the same service once; authorization is
     /// injected only when the service actually returns a valid key.
-    static func maySupportAuthorization(eid: String, readerName: String) -> Bool {
+    static func maySupportAuthorization(
+        eid: String,
+        readerName: String,
+        usesNineEsimTransport: Bool = false
+    ) -> Bool {
         guard isEID(eid) else { return false }
         if requiresAuthorization(eid: eid) { return true }
-        return readerName.range(of: "9esim", options: [.caseInsensitive]) != nil
+        return usesNineEsimTransport
+            || readerName.range(of: "9esim", options: [.caseInsensitive]) != nil
     }
 
     /// Returns nil when the service has no key for an optional/unknown model.
@@ -95,6 +100,7 @@ final class NineEsimCardAuthenticator {
         request.httpMethod = "GET"
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        NSLog("Remoble requesting card authorization key for EID %@", eid)
 
         let (data, response): (Data, URLResponse)
         do {
@@ -109,6 +115,8 @@ final class NineEsimCardAuthenticator {
               http.url?.host?.lowercased() == Self.endpointHost else {
             throw RemobleError.message("Invalid card authorization response")
         }
+        NSLog("Remoble card authorization service returned HTTP %d for EID %@",
+              http.statusCode, eid)
         guard http.statusCode == 200 else { return nil }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let value = object["psk"] as? String,
